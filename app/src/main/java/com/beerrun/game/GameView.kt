@@ -69,10 +69,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         var maxLife = 1f
     }
 
-    private class ButtonBox(
-        val id: String,
+    private class ButtonBox {
+        var id: String = ""
         val rect: RectF = RectF()
-    )
+    }
 
     private val prefs = Prefs(context)
     private val sound = Sound(context)
@@ -85,6 +85,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     private var screenW = 1080f
     private var screenH = 1920f
+    private var uiScale = 1.45f
+
+    @Volatile
     private var state = ScreenState.MENU
     private var currentShopTab = ShopTab.MUGS
 
@@ -94,8 +97,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private var levelPage = 0
 
     // Touch tracking
-    private var touchDownX = 0f
-    private var touchDownY = 0f
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isDraggingScroll = false
@@ -104,6 +105,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     // Gameplay state (fully reset on every level start!)
     private var levelData: LevelData? = null
     private var playerZ = 0f
+    private var runElapsedSec = 0f
     private var slowTimer = 0f
     private var totalTimeSec = 0f
 
@@ -128,7 +130,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val particles = Array(120) { Particle() }
     private val flyingMugs = Array(60) { FlyingMug() }
     private val floatingTexts = Array(24) { FloatingText() }
-    private val uiButtons = ArrayList<ButtonBox>(48)
+
+    // Double-buffered thread-safe button pool (instant response, zero race conditions)
+    private val buttonPool = Array(80) { ButtonBox() }
+    private var buttonPoolIdx = 0
+    private val buttonsA = ArrayList<ButtonBox>(48)
+    private val buttonsB = ArrayList<ButtonBox>(48)
+    @Volatile
+    private var readableButtons: List<ButtonBox> = buttonsA
+    private var stagingButtons: ArrayList<ButtonBox> = buttonsA
 
     // Pre-allocated Paints, Paths, Rects
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -141,6 +151,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         color = Color.WHITE
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
+    }
+    private val textOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(220, 15, 15, 20)
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+        style = Paint.Style.STROKE
     }
     private val leftTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -176,6 +192,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         screenW = width.toFloat().coerceAtLeast(360f)
         screenH = height.toFloat().coerceAtLeast(640f)
+        uiScale = min(screenW / 720f, screenH / 1280f).coerceIn(0.85f, 1.85f)
         cachedSkyShader = null
     }
 
@@ -200,10 +217,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         sound.release()
     }
 
-    /**
-     * Обработка системной кнопки "Назад":
-     * Возвращает true, если событие перехвачено внутри игры.
-     */
     fun handleBackPress(): Boolean {
         return when (state) {
             ScreenState.PLAYING -> {
@@ -282,19 +295,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
     }
 
-    /**
-     * Полный сброс состояния и запуск выбранного уровня.
-     */
     private fun startLevel(targetLevel: Int) {
         val safeLevel = targetLevel.coerceAtLeast(1)
         prefs.level = safeLevel
 
-        // Генерируем уровень строго с нуля по seed номера уровня
         val data = LevelGenerator.generate(safeLevel, prefs)
         levelData = data
 
-        // Сброс всех таймеров и пулов эффектов
         playerZ = 0f
+        runElapsedSec = 0f
         slowTimer = 0f
         activeBossFight = null
         gulpAccumulator = 0f
@@ -311,7 +320,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         for (fm in flyingMugs) fm.active = false
         for (ft in floatingTexts) ft.active = false
 
-        // Стартовое количество кружек: строго Config.START_COUNT + постоянное улучшение + бонус
         var startMugs = Config.START_COUNT + prefs.getUpgradeLevel(Config.UpgradeType.START_MUGS)
         var boostersUsedNow = 0
 
@@ -371,6 +379,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         if (state != ScreenState.PLAYING) return
         val data = levelData ?: return
 
+        runElapsedSec += dt
         if (happyHourTimer > 0f) {
             happyHourTimer = (happyHourTimer - dt).coerceAtLeast(0f)
         }
@@ -382,18 +391,17 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         data.miniBoss?.update(dt)
         data.mainBoss.update(dt)
 
-        // Если идёт схватка с боссом (мини-босс или финальный босс)
         val boss = activeBossFight
         if (boss != null) {
             updateBossFight(dt, data, boss)
             return
         }
 
-        // Движение вперёд по дорожке
-        val speedMul = if (slowTimer > 0f) 0.52f else 1.0f
-        playerZ += Config.BASE_RUN_SPEED * speedMul * dt
+        // Плавный разгон в первые 1.2 секунды уровня + спокойная базовая скорость
+        val startRamp = (0.65f + 0.35f * (runElapsedSec / 1.2f)).coerceIn(0.65f, 1.0f)
+        val slowMul = if (slowTimer > 0f) 0.55f else 1.0f
+        playerZ += Config.BASE_RUN_SPEED * startRamp * slowMul * dt
 
-        // Отслеживание максимума кружек для ачивок
         prefs.setStatMax("max_mugs_run", crowd.count)
 
         // 1. Проверка рамок (Gates)
@@ -408,11 +416,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 2. Проверка подбираемых предметов (бонусные кружки и сундуки)
+        // 2. Проверка подбираемых предметов
         for (pickup in data.pickups) {
             if (pickup.collected) continue
             val dz = pickup.z - playerZ
-            if (crowd.hasMagnet && dz in -40f..320f) {
+            if (crowd.hasMagnet && dz in -40f..380f) {
                 pickup.x += (crowd.centerX - pickup.x) * (dt * 7f).coerceIn(0f, 1f)
             }
             if (abs(dz) < 38f && abs(pickup.x - crowd.centerX) <= crowd.crowdRadius + 0.24f) {
@@ -420,7 +428,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 sound.playPickup()
                 if (pickup.type == PickupType.BONUS_MUG) {
                     crowd.addCount(pickup.value)
-                    spawnFloatingText("+${pickup.value}", crowd.centerX, screenH * 0.68f, Color.rgb(255, 224, 130))
+                    spawnFloatingText("+${pickup.value} кружек", crowd.centerX, screenH * 0.64f, Color.rgb(255, 224, 130))
                     spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(255, 213, 79), 10)
                 } else {
                     val gained = computeCoinGain(pickup.value)
@@ -428,7 +436,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     prefs.coins += gained
                     prefs.addStat("coins_total", gained)
                     prefs.addStat("chests_opened", 1)
-                    spawnFloatingText("+$gained монет", crowd.centerX, screenH * 0.66f, Color.rgb(255, 215, 0))
+                    spawnFloatingText("+$gained монет", crowd.centerX, screenH * 0.62f, Color.rgb(255, 215, 0))
                     spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(255, 215, 0), 14)
                     checkAndShowAchievements()
                 }
@@ -443,12 +451,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (obs.type == ObstacleType.NARROW_BRIDGE) {
                 if (playerZ in obs.z..(obs.z + obs.lengthZ) && obs.hitTimer <= 0f) {
                     if (abs(crowd.centerX) > obs.halfWidth) {
-                        obs.hitTimer = 0.25f
+                        obs.hitTimer = 0.32f
                         val lost = max(1, (crowd.count * 0.14f).toInt())
                         crowd.addCount(-lost)
                         runHitTrap = true
                         sound.playTrap()
-                        spawnFloatingText("-$lost (край моста!)", crowd.centerX, screenH * 0.68f, Color.rgb(255, 112, 67))
+                        spawnFloatingText("-$lost (край моста!)", crowd.centerX, screenH * 0.64f, Color.rgb(255, 112, 67))
                         if (crowd.count <= 0) {
                             triggerLose()
                             return
@@ -471,7 +479,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 4. Проверка человечков-противников (EnemyGroup)
+        // 4. Проверка человечков-противников
         for (enemy in data.enemies) {
             if (enemy.defeated) continue
             if (abs(enemy.z - playerZ) < 42f) {
@@ -486,7 +494,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 5. Проверка мини-босса посередине уровня
+        // 5. Проверка мини-босса
         val mini = data.miniBoss
         if (mini != null && !mini.defeated && playerZ >= mini.z - 55f) {
             playerZ = mini.z - 55f
@@ -495,7 +503,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             return
         }
 
-        // 6. Проверка финального босса в конце уровня
+        // 6. Проверка финального босса
         if (playerZ >= data.mainBoss.z - 75f) {
             playerZ = data.mainBoss.z - 75f
             activeBossFight = data.mainBoss
@@ -504,7 +512,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun handleGateRowCollision(row: GateRow) {
-        // Выбираем ближайшую к центру толпы рамку в ряду
         val offsetX = row.getOffsetX(totalTimeSec)
         var chosen: GateItem? = null
         var bestDist = Float.MAX_VALUE
@@ -519,13 +526,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         val gate = chosen ?: return
         gate.triggered = true
 
-        // Ледяной бочонок превращает первую плохую рамку в +5!
         if (!gate.isPositive() && activeIceKeg) {
             activeIceKeg = false
             gate.op = Config.GateOp.ADD
             gate.value = 5
             sound.playShieldBlock()
-            spawnFloatingText("Лёд: +5!", crowd.centerX, screenH * 0.65f, Color.rgb(128, 222, 234))
+            spawnFloatingText("Лёд: +5!", crowd.centerX, screenH * 0.62f, Color.rgb(128, 222, 234))
             spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(128, 222, 234), 16)
         }
 
@@ -535,7 +541,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             runGoodGateStreak++
             prefs.setStatMax("max_good_gate_streak", runGoodGateStreak)
             crowd.applyGate(gate.op, effVal)
-            spawnFloatingText(gate.formatLabel(happyHourTimer > 0f), crowd.centerX, screenH * 0.66f, Color.rgb(105, 240, 174))
+            spawnFloatingText(gate.formatLabel(happyHourTimer > 0f), crowd.centerX, screenH * 0.63f, Color.rgb(105, 240, 174))
             spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(105, 240, 174), 14)
         } else {
             sound.playGateBad()
@@ -545,7 +551,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 runHitDivGate = true
             }
             crowd.applyGate(gate.op, effVal)
-            spawnFloatingText(gate.formatLabel(false), crowd.centerX, screenH * 0.66f, Color.rgb(255, 82, 82))
+            spawnFloatingText(gate.formatLabel(false), crowd.centerX, screenH * 0.63f, Color.rgb(255, 82, 82))
             spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(255, 82, 82), 14)
         }
         prefs.setStatMax("max_mugs_run", crowd.count)
@@ -555,7 +561,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         if (crowd.hasShield) {
             crowd.hasShield = false
             sound.playShieldBlock()
-            spawnFloatingText("Щит спас!", crowd.centerX, screenH * 0.66f, Color.rgb(129, 212, 250))
+            spawnFloatingText("Щит спас!", crowd.centerX, screenH * 0.63f, Color.rgb(129, 212, 250))
             spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(225, 245, 254), 18)
             return
         }
@@ -569,20 +575,20 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             ObstacleType.SAW -> {
                 val loss = max(3, (crowd.count * 0.25f).toInt())
                 crowd.addCount(-loss)
-                spawnFloatingText("-$loss", crowd.centerX, screenH * 0.66f, Color.rgb(255, 82, 82))
+                spawnFloatingText("Пила! -$loss", crowd.centerX, screenH * 0.63f, Color.rgb(255, 82, 82))
                 spawnBurst(px, py, Color.rgb(255, 138, 101), 16)
             }
             ObstacleType.PUDDLE -> {
-                slowTimer = 1.6f
+                slowTimer = 1.4f
                 val loss = max(1, (crowd.count * 0.10f).toInt())
                 crowd.addCount(-loss)
-                spawnFloatingText("Липко! -$loss", crowd.centerX, screenH * 0.66f, Color.rgb(255, 202, 40))
+                spawnFloatingText("Лужа! -$loss", crowd.centerX, screenH * 0.63f, Color.rgb(255, 202, 40))
                 spawnBurst(px, py, Color.rgb(255, 179, 0), 12)
             }
             ObstacleType.CRATE -> {
                 val loss = max(2, (crowd.count * 0.18f).toInt())
                 crowd.addCount(-loss)
-                spawnFloatingText("Бах! -$loss", crowd.centerX, screenH * 0.66f, Color.rgb(255, 112, 67))
+                spawnFloatingText("Ящик! -$loss", crowd.centerX, screenH * 0.63f, Color.rgb(255, 112, 67))
                 spawnBurst(px, py, Color.rgb(161, 136, 127), 14)
             }
             ObstacleType.NARROW_BRIDGE -> Unit
@@ -599,7 +605,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             crowd.hasShield = false
             rivalCount = (rivalCount - 6).coerceAtLeast(0)
             sound.playShieldBlock()
-            spawnFloatingText("Щит раскидал врагов!", crowd.centerX, screenH * 0.64f, Color.rgb(129, 212, 250))
+            spawnFloatingText("Щит раскидал врагов!", crowd.centerX, screenH * 0.61f, Color.rgb(129, 212, 250))
         }
 
         sound.playTrap()
@@ -608,7 +614,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         if (crowd.count >= rivalCount) {
             crowd.addCount(-rivalCount)
             prefs.addStat("enemies_defeated", enemy.initialCount)
-            spawnFloatingText("Победа над толпой! -$rivalCount", crowd.centerX, screenH * 0.68f, Color.rgb(255, 213, 79))
+            spawnFloatingText("Победа! -$rivalCount", crowd.centerX, screenH * 0.64f, Color.rgb(255, 213, 79))
             checkAndShowAchievements()
         } else {
             crowd.setCount(0)
@@ -616,13 +622,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun updateBossFight(dt: Float, data: LevelData, boss: Boss) {
-        // Плавно подтягиваем толпу к центру перед боссом
         crowd.centerX += (0f - crowd.centerX) * (dt * 6f).coerceIn(0f, 1f)
 
-        // Обновляем летящие кружки в рот боссу
         for (fm in flyingMugs) {
             if (fm.active) {
-                fm.progress += dt * 4.5f
+                fm.progress += dt * 4.2f
                 if (fm.progress >= 1f) {
                     fm.active = false
                 }
@@ -645,7 +649,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     runCoinsEarned += bonus
                     prefs.coins += bonus
                     prefs.addStat("coins_total", bonus)
-                    spawnFloatingText("Страж повержен! +$bonus монет", 0f, screenH * 0.45f, Color.rgb(255, 215, 0))
+                    spawnFloatingText("Страж повержен! +$bonus м.", 0f, screenH * 0.45f, Color.rgb(255, 215, 0))
                     activeBossFight = null
                     checkAndShowAchievements()
                     return
@@ -681,9 +685,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
         if (!runHitTrap) {
             prefs.addStat("trapless_wins", 1)
-        } else {
-            // Сбрасываем серию без ловушек если попались
-            prefs.setStatMax("trapless_wins", prefs.getStat("trapless_wins"))
         }
         if (data.isMegaBoss) {
             prefs.addStat("mega_boss_wins", 1)
@@ -748,9 +749,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 val spd = 110f + rng.nextFloat() * 290f
                 p.vx = cos(angle) * spd
                 p.vy = sin(angle) * spd - 90f
-                p.radius = 5f + rng.nextFloat() * 7f
+                p.radius = 6f + rng.nextFloat() * 8f
                 p.color = color
-                p.life = 0.45f + rng.nextFloat() * 0.35f
+                p.life = 0.50f + rng.nextFloat() * 0.35f
                 p.maxLife = p.life
                 spawned++
                 if (spawned >= count) break
@@ -774,7 +775,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 p.y = y
                 p.vx = (rng.nextFloat() - 0.5f) * 520f
                 p.vy = -180f - rng.nextFloat() * 420f
-                p.radius = 7f + rng.nextFloat() * 7f
+                p.radius = 8f + rng.nextFloat() * 8f
                 p.color = colors[spawned % colors.size]
                 p.life = 1.4f + rng.nextFloat() * 0.8f
                 p.maxLife = p.life
@@ -792,8 +793,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 ft.x = screenW * 0.5f + normX * (screenW * 0.34f)
                 ft.y = y
                 ft.color = color
-                ft.life = 0.95f
-                ft.maxLife = 0.95f
+                ft.life = 1.35f
+                ft.maxLife = 1.35f
                 return
             }
         }
@@ -814,17 +815,29 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private fun updateFloatingTexts(dt: Float) {
         for (ft in floatingTexts) {
             if (ft.active) {
-                ft.y -= 95f * dt
+                ft.y -= 75f * dt
                 ft.life -= dt
                 if (ft.life <= 0f) ft.active = false
             }
         }
     }
 
+    // ==================== BUTTON POOL HELPER ====================
+
+    private fun registerButton(id: String, left: Float, top: Float, right: Float, bottom: Float) {
+        if (buttonPoolIdx >= buttonPool.size) return
+        val box = buttonPool[buttonPoolIdx++]
+        box.id = id
+        box.rect.set(left, top, right, bottom)
+        stagingButtons.add(box)
+    }
+
     // ==================== RENDERING (ZERO ALLOCATIONS) ====================
 
     private fun render(canvas: Canvas) {
-        uiButtons.clear()
+        buttonPoolIdx = 0
+        stagingButtons = if (readableButtons === buttonsA) buttonsB else buttonsA
+        stagingButtons.clear()
 
         when (state) {
             ScreenState.MENU -> renderMenu(canvas)
@@ -848,13 +861,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
         renderParticlesAndTexts(canvas)
         renderAchievementBanner(canvas)
+
+        // Атомарная публикация актуальных кнопок для UI-потока
+        readableButtons = stagingButtons
     }
 
     private fun renderGameplay(canvas: Canvas) {
         val data = levelData ?: return
         val loc = data.location
 
-        // 1. Sky background
         if (cachedSkyShader == null || cachedSkyTop != loc.skyTop || cachedSkyBottom != loc.skyBottom) {
             cachedSkyTop = loc.skyTop
             cachedSkyBottom = loc.skyBottom
@@ -864,17 +879,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         canvas.drawRect(0f, 0f, screenW, screenH * 0.42f, fillPaint)
         fillPaint.shader = null
 
-        // Location ambient sky decor (stars in space, sun on beach/desert, etc.)
         drawLocationSkyDecor(canvas, loc)
 
-        // 2. Roadside terrain
         val horizonY = screenH * 0.34f
         fillPaint.color = loc.sideColor
         canvas.drawRect(0f, horizonY, screenW, screenH, fillPaint)
 
-        // 3. Perspective Track
-        val bottomHalfW = screenW * 0.43f
-        val topHalfW = screenW * 0.13f
+        val bottomHalfW = screenW * 0.44f
+        val topHalfW = screenW * 0.14f
         val cx = screenW * 0.5f
 
         tempPath.reset()
@@ -886,11 +898,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         fillPaint.color = loc.trackMain
         canvas.drawPath(tempPath, fillPaint)
 
-        // Animated road stripes for speed sensation
-        val viewDist = 920f
-        val stripeStep = 115f
+        // Увеличенная дистанция обзора (1250 вместо 920), чтобы заранее видеть рамки
+        val viewDist = 1250f
+        val stripeStep = 140f
         val firstStripeIdx = (playerZ / stripeStep).toInt()
-        for (idx in firstStripeIdx..(firstStripeIdx + 9)) {
+        for (idx in firstStripeIdx..(firstStripeIdx + 10)) {
             val z0 = idx * stripeStep - playerZ
             val z1 = z0 + stripeStep * 0.5f
             if (z1 <= 0f || z0 >= viewDist) continue
@@ -912,18 +924,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 canvas.drawPath(tempPath, fillPaint)
             }
 
-            // Roadside thematic props
-            drawLocationRoadProp(canvas, loc, idx, cx - hw0 - 28f * p0, y0, p0)
-            drawLocationRoadProp(canvas, loc, idx + 1, cx + hw0 + 28f * p0, y0, p0)
+            drawLocationRoadProp(canvas, loc, idx, cx - hw0 - 30f * p0, y0, p0)
+            drawLocationRoadProp(canvas, loc, idx + 1, cx + hw0 + 30f * p0, y0, p0)
         }
 
-        // Track side rails
         strokePaint.color = loc.railColor
         strokePaint.strokeWidth = 8f
         canvas.drawLine(cx - topHalfW, horizonY, cx - bottomHalfW, screenH, strokePaint)
         canvas.drawLine(cx + topHalfW, horizonY, cx + bottomHalfW, screenH, strokePaint)
 
-        // 4. Narrow bridges & puddles on road surface
+        // Узкие мосты и лужи
         for (obs in data.obstacles) {
             if (obs.type == ObstacleType.NARROW_BRIDGE) {
                 val relStart = obs.z - playerZ
@@ -936,11 +946,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     val hw0 = topHalfW + (bottomHalfW - topHalfW) * p0
                     val hw1 = topHalfW + (bottomHalfW - topHalfW) * p1
 
-                    // Abyss outside narrow bridge
                     fillPaint.color = Color.argb(185, 15, 20, 35)
                     canvas.drawRect(cx - hw1, y0, cx + hw1, y1, fillPaint)
 
-                    // Safe wooden bridge plank in middle
                     val b0 = hw0 * obs.halfWidth
                     val b1 = hw1 * obs.halfWidth
                     tempPath.reset()
@@ -968,7 +976,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 5. Pickups (bonus mugs & chests)
+        // Бонусные кружки и сундуки
         val mugSkin = Config.getMugSkin(prefs.selectedSkinId)
         for (pickup in data.pickups) {
             if (pickup.collected) continue
@@ -978,12 +986,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 val sy = horizonY + (screenH - horizonY) * p
                 val hw = topHalfW + (bottomHalfW - topHalfW) * p
                 val sx = cx + pickup.x * hw
-                val itemSize = (46f * p).coerceAtLeast(14f)
+                val itemSize = (54f * p).coerceAtLeast(16f)
 
                 if (pickup.type == PickupType.BONUS_MUG) {
                     crowd.drawSingleMug(canvas, sx, sy, itemSize, itemSize * 1.35f, mugSkin, totalTimeSec)
                 } else {
-                    // Coin chest
                     fillPaint.color = Color.rgb(141, 85, 36)
                     tempRect.set(sx - itemSize * 0.65f, sy - itemSize * 0.85f, sx + itemSize * 0.65f, sy)
                     canvas.drawRoundRect(tempRect, 8f, 8f, fillPaint)
@@ -993,7 +1000,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 6. Solid Obstacles (Saws & Crates)
+        // Пилы и ящики
         for (obs in data.obstacles) {
             if (obs.triggered || obs.type == ObstacleType.NARROW_BRIDGE || obs.type == ObstacleType.PUDDLE) continue
             val relZ = obs.z - playerZ
@@ -1018,7 +1025,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 7. Enemy Groups (Человечки-противники)
+        // Противники
         for (enemy in data.enemies) {
             if (enemy.defeated) continue
             val relZ = enemy.z - playerZ
@@ -1031,7 +1038,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             }
         }
 
-        // 8. Gates (Back-to-front)
+        // Крупные хорошо читаемые рамки (Gates)
         val happyActive = happyHourTimer > 0f
         for (i in data.gateRows.size - 1 downTo 0) {
             val row = data.gateRows[i]
@@ -1041,7 +1048,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 val p = projectDepth(relZ.coerceAtLeast(0f), viewDist)
                 val sy = horizonY + (screenH - horizonY) * p
                 val hw = topHalfW + (bottomHalfW - topHalfW) * p
-                val gateH = (128f * p).coerceAtLeast(24f)
+                val gateH = (124f * p * uiScale * 0.88f).coerceAtLeast(28f)
                 val offsetX = row.getOffsetX(totalTimeSec)
 
                 for (g in row.gates) {
@@ -1051,26 +1058,32 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     val isGood = g.isPositive()
 
                     fillPaint.color = when {
-                        isGood && happyActive -> Color.argb(195, 171, 71, 188)
-                        isGood -> Color.argb(185, 0, 200, 83)
-                        activeIceKeg -> Color.argb(185, 41, 182, 246)
-                        else -> Color.argb(185, 229, 57, 53)
+                        isGood && happyActive -> Color.argb(205, 171, 71, 188)
+                        isGood -> Color.argb(195, 0, 200, 83)
+                        activeIceKeg -> Color.argb(195, 41, 182, 246)
+                        else -> Color.argb(195, 229, 57, 53)
                     }
                     tempRect.set(gx - gw, sy - gateH, gx + gw, sy)
-                    canvas.drawRoundRect(tempRect, 12f * p, 12f * p, fillPaint)
+                    canvas.drawRoundRect(tempRect, 14f * p, 14f * p, fillPaint)
 
                     strokePaint.color = Color.WHITE
-                    strokePaint.strokeWidth = (4f * p).coerceAtLeast(1.5f)
-                    canvas.drawRoundRect(tempRect, 12f * p, 12f * p, strokePaint)
+                    strokePaint.strokeWidth = (4.5f * p).coerceAtLeast(2f)
+                    canvas.drawRoundRect(tempRect, 14f * p, 14f * p, strokePaint)
 
+                    val label = g.formatLabel(happyActive)
+                    val gFont = (40f * p * uiScale * 0.9f).coerceIn(18f, 58f)
+                    textOutlinePaint.textSize = gFont
+                    textOutlinePaint.strokeWidth = (gFont * 0.14f).coerceAtLeast(3f)
                     textPaint.color = Color.WHITE
-                    textPaint.textSize = (42f * p).coerceIn(13f, 46f)
-                    canvas.drawText(g.formatLabel(happyActive), gx, sy - gateH * 0.34f, textPaint)
+                    textPaint.textSize = gFont
+                    val textY = sy - gateH * 0.30f
+                    canvas.drawText(label, gx, textY, textOutlinePaint)
+                    canvas.drawText(label, gx, textY, textPaint)
                 }
             }
         }
 
-        // 9. Mini-Boss & Main Boss
+        // Мини-босс и главный босс
         val mini = data.miniBoss
         if (mini != null && !mini.defeated) {
             val relZ = mini.z - playerZ
@@ -1085,29 +1098,26 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         if (mainBossRelZ in -20f..viewDist * 1.15f) {
             val p = projectDepth(mainBossRelZ.coerceAtLeast(0f), viewDist)
             val sy = horizonY + (screenH - horizonY) * p
-            // Finish checkerboard line under boss
             fillPaint.color = Color.WHITE
             val hw = topHalfW + (bottomHalfW - topHalfW) * p
             canvas.drawRect(cx - hw, sy - 10f * p, cx + hw, sy + 6f * p, fillPaint)
             data.mainBoss.draw(canvas, cx, sy, screenW * p.coerceAtLeast(0.38f), totalTimeSec)
         }
 
-        // 10. Player Crowd
+        // Толпа кружек игрока
         val playerBaseY = screenH * 0.77f
         val playerTrackHalfPx = topHalfW + (bottomHalfW - topHalfW) * projectDepth(110f, viewDist)
         crowd.draw(canvas, cx, playerBaseY, playerTrackHalfPx, mugSkin, totalTimeSec)
 
-        // 11. Flying mugs during boss fight
         for (fm in flyingMugs) {
             if (fm.active) {
                 val t = fm.progress
                 val fx = fm.startX + (fm.targetX - fm.startX) * t
                 val fy = fm.startY + (fm.targetY - fm.startY) * t - sin(t * 3.14159f) * 140f
-                crowd.drawSingleMug(canvas, fx, fy, 26f, 36f, mugSkin, totalTimeSec)
+                crowd.drawSingleMug(canvas, fx, fy, 30f * uiScale, 42f * uiScale, mugSkin, totalTimeSec)
             }
         }
 
-        // 12. Gameplay HUD
         renderGameplayHud(canvas, data)
     }
 
@@ -1131,39 +1141,35 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun drawEnemyGroup(canvas: Canvas, cx: Float, bottomY: Float, scale: Float, count: Int) {
-        val unitR = (15f * scale).coerceAtLeast(5f)
+        val unitR = (16f * scale).coerceAtLeast(6f)
         val shown = count.coerceIn(1, 9)
         for (i in 0 until shown) {
             val col = (i % 3) - 1
             val row = i / 3
             val ex = cx + col * unitR * 1.65f
             val ey = bottomY - row * unitR * 1.1f
-            // Red jersey body
             fillPaint.color = Color.rgb(211, 47, 47)
             canvas.drawCircle(ex, ey - unitR * 0.9f, unitR * 0.75f, fillPaint)
-            // Head
             fillPaint.color = Color.rgb(255, 204, 170)
             canvas.drawCircle(ex, ey - unitR * 1.95f, unitR * 0.55f, fillPaint)
         }
-        // Red counter badge
         val badgeY = bottomY - unitR * 3.6f
         fillPaint.color = Color.rgb(183, 28, 28)
-        tempRect.set(cx - 32f * scale.coerceAtLeast(0.5f), badgeY - 16f, cx + 32f * scale.coerceAtLeast(0.5f), badgeY + 12f)
+        val bw = 38f * scale.coerceAtLeast(0.55f)
+        tempRect.set(cx - bw, badgeY - 18f, cx + bw, badgeY + 14f)
         canvas.drawRoundRect(tempRect, 12f, 12f, fillPaint)
         textPaint.color = Color.WHITE
-        textPaint.textSize = (22f * scale).coerceIn(13f, 24f)
-        canvas.drawText(count.toString(), cx, badgeY + 5f, textPaint)
+        textPaint.textSize = (24f * scale).coerceIn(15f, 28f)
+        canvas.drawText(count.toString(), cx, badgeY + 6f, textPaint)
     }
 
     private fun drawLocationSkyDecor(canvas: Canvas, loc: Config.LocationDef) {
         when (loc.decorType) {
             2, 3 -> {
-                // Sun
                 fillPaint.color = Color.argb(210, 255, 238, 88)
                 canvas.drawCircle(screenW * 0.80f, screenH * 0.13f, 68f, fillPaint)
             }
             4 -> {
-                // Stars & ringed planet
                 fillPaint.color = Color.WHITE
                 for (i in 0 until 24) {
                     val sx = ((i * 197) % screenW.toInt()).toFloat()
@@ -1188,7 +1194,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         val sz = (44f * p).coerceAtLeast(8f)
         when (loc.decorType) {
             1 -> {
-                // Ice crystal
                 fillPaint.color = Color.rgb(179, 229, 252)
                 tempPath.reset()
                 tempPath.moveTo(x, y - sz * 1.4f)
@@ -1198,12 +1203,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 canvas.drawPath(tempPath, fillPaint)
             }
             3 -> {
-                // Cactus
                 fillPaint.color = Color.rgb(56, 142, 60)
                 canvas.drawRect(x - sz * 0.18f, y - sz * 1.3f, x + sz * 0.18f, y, fillPaint)
             }
             6 -> {
-                // Pine tree
                 fillPaint.color = Color.rgb(27, 94, 32)
                 tempPath.reset()
                 tempPath.moveTo(x, y - sz * 1.6f)
@@ -1213,7 +1216,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 canvas.drawPath(tempPath, fillPaint)
             }
             else -> {
-                // Barrel / Lamp post
                 if (seedIdx % 2 == 0) {
                     fillPaint.color = Color.rgb(109, 76, 65)
                     canvas.drawCircle(x, y - sz * 0.4f, sz * 0.42f, fillPaint)
@@ -1223,57 +1225,72 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun renderGameplayHud(canvas: Canvas, data: LevelData) {
-        // Top pill: Level + Location
-        fillPaint.color = Color.argb(175, 20, 22, 32)
-        tempRect.set(28f, 36f, screenW * 0.54f, 126f)
-        canvas.drawRoundRect(tempRect, 24f, 24f, fillPaint)
+        val s = uiScale
+        val topY = 38f * s
+        val hudH = 74f * s
+        val pauseSize = hudH
+
+        // Крупная плашка уровня и локации
+        fillPaint.color = Color.argb(190, 20, 22, 32)
+        val lvlRight = screenW * 0.54f
+        tempRect.set(20f * s, topY, lvlRight, topY + hudH)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
 
         leftTextPaint.color = Color.WHITE
-        leftTextPaint.textSize = 30f
-        canvas.drawText("Уровень ${data.levelNumber}", 52f, 76f, leftTextPaint)
+        leftTextPaint.textSize = 23f * s
+        canvas.drawText("Уровень ${data.levelNumber}", 38f * s, topY + 32f * s, leftTextPaint)
         subTextPaint.color = Color.rgb(255, 213, 79)
-        subTextPaint.textSize = 21f
-        canvas.drawText(data.location.name, 52f, 108f, subTextPaint)
+        subTextPaint.textSize = 17f * s
+        canvas.drawText(data.location.name, 38f * s, topY + 58f * s, subTextPaint)
 
-        // Progress bar along top
-        val prog = (playerZ / max(1f, data.trackLength)).coerceIn(0f, 1f)
-        fillPaint.color = Color.argb(140, 255, 255, 255)
-        tempRect.set(screenW * 0.25f, 142f, screenW * 0.75f, 156f)
-        canvas.drawRoundRect(tempRect, 7f, 7f, fillPaint)
-        fillPaint.color = Color.rgb(255, 193, 7)
-        tempRect.set(screenW * 0.25f, 142f, screenW * 0.25f + (screenW * 0.50f) * prog, 156f)
-        canvas.drawRoundRect(tempRect, 7f, 7f, fillPaint)
-
-        // Coins pill
-        fillPaint.color = Color.argb(175, 20, 22, 32)
-        tempRect.set(screenW * 0.56f, 36f, screenW - 132f, 126f)
-        canvas.drawRoundRect(tempRect, 24f, 24f, fillPaint)
+        // Крупная плашка монет
+        val coinLeft = lvlRight + 12f * s
+        val coinRight = screenW - 20f * s - pauseSize - 12f * s
+        fillPaint.color = Color.argb(190, 20, 22, 32)
+        tempRect.set(coinLeft, topY, coinRight, topY + hudH)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 28f
-        canvas.drawText("${prefs.coins}", tempRect.centerX(), 90f, textPaint)
+        textPaint.textSize = 23f * s
+        canvas.drawText("${prefs.coins}", tempRect.centerX(), topY + hudH * 0.62f, textPaint)
 
-        // Pause Button (top-right corner)
-        val pauseRect = RectF(screenW - 116f, 36f, screenW - 28f, 126f)
-        fillPaint.color = Color.argb(210, 38, 50, 56)
-        canvas.drawRoundRect(pauseRect, 24f, 24f, fillPaint)
+        // Большая кнопка паузы в правом верхнем углу
+        val pauseLeft = screenW - 20f * s - pauseSize
+        val pauseRight = screenW - 20f * s
+        val pauseBottom = topY + pauseSize
+        fillPaint.color = Color.argb(220, 38, 50, 56)
+        tempRect.set(pauseLeft, topY, pauseRight, pauseBottom)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
         strokePaint.color = Color.WHITE
-        strokePaint.strokeWidth = 3f
-        canvas.drawRoundRect(pauseRect, 24f, 24f, strokePaint)
+        strokePaint.strokeWidth = 3f * s
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, strokePaint)
 
         fillPaint.color = Color.WHITE
-        canvas.drawRect(pauseRect.centerX() - 14f, pauseRect.centerY() - 18f, pauseRect.centerX() - 5f, pauseRect.centerY() + 18f, fillPaint)
-        canvas.drawRect(pauseRect.centerX() + 5f, pauseRect.centerY() - 18f, pauseRect.centerX() + 14f, pauseRect.centerY() + 18f, fillPaint)
-        uiButtons.add(ButtonBox("pause", RectF(pauseRect)))
+        val pCx = tempRect.centerX()
+        val pCy = tempRect.centerY()
+        canvas.drawRect(pCx - 12f * s, pCy - 16f * s, pCx - 4f * s, pCy + 16f * s, fillPaint)
+        canvas.drawRect(pCx + 4f * s, pCy - 16f * s, pCx + 12f * s, pCy + 16f * s, fillPaint)
+        registerButton("pause", pauseLeft, topY, pauseRight, pauseBottom)
 
-        // Active booster badges below HUD
-        var badgeY = 178f
+        // Полоса прогресса уровня
+        val progY = topY + hudH + 14f * s
+        val progH = 12f * s
+        val prog = (playerZ / max(1f, data.trackLength)).coerceIn(0f, 1f)
+        fillPaint.color = Color.argb(150, 255, 255, 255)
+        tempRect.set(screenW * 0.20f, progY, screenW * 0.80f, progY + progH)
+        canvas.drawRoundRect(tempRect, progH * 0.5f, progH * 0.5f, fillPaint)
+        fillPaint.color = Color.rgb(255, 193, 7)
+        tempRect.set(screenW * 0.20f, progY, screenW * 0.20f + (screenW * 0.60f) * prog, progY + progH)
+        canvas.drawRoundRect(tempRect, progH * 0.5f, progH * 0.5f, fillPaint)
+
+        // Активные бонусы
+        var badgeY = progY + progH + 14f * s
         if (happyHourTimer > 0f) {
             drawMiniHudTag(canvas, "Счастливый час: ${happyHourTimer.toInt() + 1}с", Color.rgb(171, 71, 188), badgeY)
-            badgeY += 42f
+            badgeY += 36f * s
         }
         if (activeIceKeg) {
             drawMiniHudTag(canvas, "Ледяной бочонок готов", Color.rgb(41, 182, 246), badgeY)
-            badgeY += 42f
+            badgeY += 36f * s
         }
         if (activeDoubleCoins) {
             drawMiniHudTag(canvas, "Золотой множитель x2", Color.rgb(255, 179, 0), badgeY)
@@ -1281,110 +1298,122 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     private fun drawMiniHudTag(canvas: Canvas, label: String, color: Int, y: Float) {
-        fillPaint.color = Color.argb(200, Color.red(color), Color.green(color), Color.blue(color))
-        tempRect.set(28f, y, 360f, y + 34f)
-        canvas.drawRoundRect(tempRect, 17f, 17f, fillPaint)
+        val s = uiScale
+        fillPaint.color = Color.argb(215, Color.red(color), Color.green(color), Color.blue(color))
+        tempRect.set(20f * s, y, 280f * s, y + 30f * s)
+        canvas.drawRoundRect(tempRect, 15f * s, 15f * s, fillPaint)
         leftTextPaint.color = Color.WHITE
-        leftTextPaint.textSize = 20f
-        canvas.drawText(label, 44f, y + 24f, leftTextPaint)
+        leftTextPaint.textSize = 16f * s
+        canvas.drawText(label, 34f * s, y + 21f * s, leftTextPaint)
     }
 
-    // ==================== MENU & SCREENS ====================
+    // ==================== MENU & SCREENS (LARGE UI) ====================
 
     private fun renderMenu(canvas: Canvas) {
-        // Warm tavern gradient background
+        val s = uiScale
+
         fillPaint.color = Color.rgb(34, 22, 18)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        fillPaint.color = Color.argb(40, 255, 193, 7)
-        canvas.drawCircle(screenW * 0.5f, screenH * 0.28f, screenW * 0.52f, fillPaint)
+        fillPaint.color = Color.argb(42, 255, 193, 7)
+        canvas.drawCircle(screenW * 0.5f, screenH * 0.26f, screenW * 0.54f, fillPaint)
 
-        // Top Coins & Sound Toggle
-        fillPaint.color = Color.argb(190, 55, 38, 30)
-        tempRect.set(32f, 42f, 320f, 114f)
-        canvas.drawRoundRect(tempRect, 36f, 36f, fillPaint)
+        // Крупная верхняя панель: Монеты и Звук
+        val topY = 42f * s
+        val pillH = 62f * s
+        fillPaint.color = Color.argb(205, 58, 40, 32)
+        tempRect.set(24f * s, topY, 260f * s, topY + pillH)
+        canvas.drawRoundRect(tempRect, 31f * s, 31f * s, fillPaint)
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 30f
-        canvas.drawText("Монеты: ${prefs.coins}", tempRect.centerX(), 88f, textPaint)
+        textPaint.textSize = 23f * s
+        canvas.drawText("Монеты: ${prefs.coins}", tempRect.centerX(), topY + pillH * 0.63f, textPaint)
 
-        val muteRect = RectF(screenW - 124f, 42f, screenW - 32f, 114f)
-        fillPaint.color = Color.argb(190, 55, 38, 30)
-        canvas.drawRoundRect(muteRect, 24f, 24f, fillPaint)
+        val muteLeft = screenW - 125f * s
+        val muteRight = screenW - 24f * s
+        fillPaint.color = Color.argb(205, 58, 40, 32)
+        tempRect.set(muteLeft, topY, muteRight, topY + pillH)
+        canvas.drawRoundRect(tempRect, 22f * s, 22f * s, fillPaint)
         textPaint.color = Color.WHITE
-        textPaint.textSize = 24f
-        canvas.drawText(if (sound.muted) "OFF" else "ЗВУК", muteRect.centerX(), 86f, textPaint)
-        uiButtons.add(ButtonBox("toggle_mute", RectF(muteRect)))
+        textPaint.textSize = 20f * s
+        canvas.drawText(if (sound.muted) "ВЫКЛ" else "ЗВУК", tempRect.centerX(), topY + pillH * 0.63f, textPaint)
+        registerButton("toggle_mute", muteLeft, topY, muteRight, topY + pillH)
 
-        // Game Logo
+        // Крупный заголовок игры
         textPaint.color = Color.rgb(255, 193, 7)
-        textPaint.textSize = 78f
-        canvas.drawText("BEER RUN", screenW * 0.5f, screenH * 0.16f, textPaint)
+        textPaint.textSize = 58f * s
+        canvas.drawText("BEER RUN", screenW * 0.5f, screenH * 0.145f, textPaint)
         textPaint.color = Color.rgb(255, 248, 225)
-        textPaint.textSize = 28f
-        canvas.drawText("Пенный забег • Уровень ${prefs.level}", screenW * 0.5f, screenH * 0.205f, textPaint)
+        textPaint.textSize = 22f * s
+        canvas.drawText("Пенный забег • Уровень ${prefs.level}", screenW * 0.5f, screenH * 0.182f, textPaint)
 
-        // Animated preview of selected mug skin
+        // Превью кружки
         val selectedSkin = Config.getMugSkin(prefs.selectedSkinId)
-        val previewBob = sin(totalTimeSec * 4f) * 10f
+        val previewBob = sin(totalTimeSec * 4f) * 8f
         crowd.drawSingleMug(
             canvas,
             screenW * 0.5f,
-            screenH * 0.37f + previewBob,
-            135f,
-            185f,
+            screenH * 0.31f + previewBob,
+            105f * s,
+            145f * s,
             selectedSkin,
             totalTimeSec
         )
 
-        // Pre-run Booster quick-toggle strip
-        textPaint.color = Color.rgb(220, 210, 195)
-        textPaint.textSize = 23f
-        canvas.drawText("Бонусы на забег (нажми чтобы взять):", screenW * 0.5f, screenH * 0.425f, textPaint)
+        // Крупные карточки бонусов в 2 колонки (6 штук: 2x3)
+        textPaint.color = Color.rgb(235, 225, 210)
+        textPaint.textSize = 19f * s
+        canvas.drawText("Бонусы на забег (нажми чтобы взять):", screenW * 0.5f, screenH * 0.352f, textPaint)
 
         val boosters = Config.BoosterType.values()
-        val cellW = (screenW - 84f) / 3f
-        val cellH = 84f
+        val pad = 24f * s
+        val colGap = 14f * s
+        val rowGap = 12f * s
+        val cellW = (screenW - pad * 2f - colGap) / 2f
+        val cellH = 66f * s
+        val gridStartY = screenH * 0.368f
+
         for (i in boosters.indices) {
             val b = boosters[i]
-            val col = i % 3
-            val row = i / 3
-            val bx = 32f + col * (cellW + 10f)
-            val by = screenH * 0.44f + row * (cellH + 10f)
-            val rect = RectF(bx, by, bx + cellW, by + cellH)
+            val col = i % 2
+            val row = i / 2
+            val bx = pad + col * (cellW + colGap)
+            val by = gridStartY + row * (cellH + rowGap)
             val armed = prefs.isBoosterArmed(b)
             val cnt = prefs.getBoosterCount(b)
 
             fillPaint.color = when {
                 armed -> Color.rgb(46, 125, 50)
-                cnt > 0 -> Color.rgb(66, 48, 38)
-                else -> Color.rgb(44, 34, 28)
+                cnt > 0 -> Color.rgb(68, 50, 40)
+                else -> Color.rgb(46, 35, 29)
             }
-            canvas.drawRoundRect(rect, 18f, 18f, fillPaint)
+            tempRect.set(bx, by, bx + cellW, by + cellH)
+            canvas.drawRoundRect(tempRect, 16f * s, 16f * s, fillPaint)
             strokePaint.color = if (armed) Color.rgb(105, 240, 174) else b.color
-            strokePaint.strokeWidth = if (armed) 4f else 2f
-            canvas.drawRoundRect(rect, 18f, 18f, strokePaint)
+            strokePaint.strokeWidth = if (armed) 3.5f * s else 2f * s
+            canvas.drawRoundRect(tempRect, 16f * s, 16f * s, strokePaint)
 
             textPaint.color = Color.WHITE
-            textPaint.textSize = 20f
-            canvas.drawText(b.title, rect.centerX(), by + 34f, textPaint)
-            textPaint.color = if (cnt > 0) Color.rgb(255, 215, 0) else Color.GRAY
-            textPaint.textSize = 20f
+            textPaint.textSize = 18f * s
+            canvas.drawText(b.title, tempRect.centerX(), by + 28f * s, textPaint)
+            textPaint.color = if (cnt > 0) Color.rgb(255, 215, 0) else Color.rgb(165, 165, 175)
+            textPaint.textSize = 17f * s
             val statusTxt = if (armed) "ВЗЯТО (x$cnt)" else "Запас: x$cnt"
-            canvas.drawText(statusTxt, rect.centerX(), by + 64f, textPaint)
+            canvas.drawText(statusTxt, tempRect.centerX(), by + 53f * s, textPaint)
 
-            uiButtons.add(ButtonBox("arm_booster:${b.id}", rect))
+            registerButton("arm_booster:${b.id}", bx, by, bx + cellW, by + cellH)
         }
 
-        // 4 Main Menu Buttons
-        val btnStartY = screenH * 0.59f
-        val btnW = screenW - 120f
-        val btnH = 92f
-        val gap = 20f
+        // 4 большие кнопки главного меню
+        val btnStartY = gridStartY + 3 * (cellH + rowGap) + 18f * s
+        val btnW = screenW - 72f * s
+        val btnX = 36f * s
+        val btnH = 74f * s
+        val gap = 16f * s
 
-        drawMenuButton(canvas, "play_current", "ИГРАТЬ (Ур. ${prefs.level})", 60f, btnStartY, btnW, btnH, Color.rgb(255, 160, 0), Color.rgb(40, 20, 5))
-        drawMenuButton(canvas, "open_levels", "ВЫБОР УРОВНЯ", 60f, btnStartY + (btnH + gap), btnW, btnH * 0.88f, Color.rgb(30, 136, 229), Color.WHITE)
-        drawMenuButton(canvas, "open_shop", "МАГАЗИН", 60f, btnStartY + (btnH + gap) * 1.92f, btnW, btnH * 0.88f, Color.rgb(67, 160, 71), Color.WHITE)
-        drawMenuButton(canvas, "open_achievements", "АЧИВКИ", 60f, btnStartY + (btnH + gap) * 2.84f, btnW, btnH * 0.88f, Color.rgb(142, 36, 170), Color.WHITE)
+        drawMenuButton(canvas, "play_current", "ИГРАТЬ (Ур. ${prefs.level})", btnX, btnStartY, btnW, btnH, Color.rgb(255, 160, 0), Color.rgb(40, 20, 5))
+        drawMenuButton(canvas, "open_levels", "ВЫБОР УРОВНЯ", btnX, btnStartY + (btnH + gap), btnW, btnH * 0.92f, Color.rgb(30, 136, 229), Color.WHITE)
+        drawMenuButton(canvas, "open_shop", "МАГАЗИН", btnX, btnStartY + (btnH + gap) * 1.95f, btnW, btnH * 0.92f, Color.rgb(67, 160, 71), Color.WHITE)
+        drawMenuButton(canvas, "open_achievements", "АЧИВКИ", btnX, btnStartY + (btnH + gap) * 2.90f, btnW, btnH * 0.92f, Color.rgb(142, 36, 170), Color.WHITE)
     }
 
     private fun drawMenuButton(
@@ -1398,32 +1427,34 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         bgColor: Int,
         txtColor: Int
     ) {
-        val rect = RectF(x, y, x + w, y + h)
+        val s = uiScale
+        tempRect.set(x, y, x + w, y + h)
         fillPaint.color = bgColor
-        canvas.drawRoundRect(rect, 26f, 26f, fillPaint)
-        strokePaint.color = Color.argb(120, 255, 255, 255)
-        strokePaint.strokeWidth = 3f
-        canvas.drawRoundRect(rect, 26f, 26f, strokePaint)
+        canvas.drawRoundRect(tempRect, 24f * s, 24f * s, fillPaint)
+        strokePaint.color = Color.argb(135, 255, 255, 255)
+        strokePaint.strokeWidth = 2.5f * s
+        canvas.drawRoundRect(tempRect, 24f * s, 24f * s, strokePaint)
 
         textPaint.color = txtColor
-        textPaint.textSize = 32f
-        canvas.drawText(label, rect.centerX(), rect.centerY() + 11f, textPaint)
-        uiButtons.add(ButtonBox(id, rect))
+        textPaint.textSize = 25f * s
+        canvas.drawText(label, tempRect.centerX(), tempRect.centerY() + 9f * s, textPaint)
+        registerButton(id, x, y, x + w, y + h)
     }
 
     private fun renderLevelSelect(canvas: Canvas) {
+        val s = uiScale
         fillPaint.color = Color.rgb(24, 28, 42)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        renderTopHeader(canvas, "ВЫБОР УРОВНЯ")
+        renderTopHeader(canvas, "УРОВНИ")
 
         val maxUnlocked = prefs.maxUnlockedLevel
         val startLvl = levelPage * 20 + 1
         val cols = 4
-        val pad = 28f
-        val gap = 18f
+        val pad = 24f * s
+        val gap = 14f * s
         val cellSize = (screenW - pad * 2f - gap * (cols - 1)) / cols
-        val gridTop = 185f
+        val gridTop = 135f * s
 
         for (i in 0 until 20) {
             val lvl = startLvl + i
@@ -1431,7 +1462,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             val row = i / cols
             val x = pad + col * (cellSize + gap)
             val y = gridTop + row * (cellSize + gap)
-            val rect = RectF(x, y, x + cellSize, y + cellSize)
+            tempRect.set(x, y, x + cellSize, y + cellSize)
             val unlocked = lvl <= maxUnlocked
             val isBossLvl = (lvl % 5 == 0)
 
@@ -1441,69 +1472,72 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 lvl == prefs.level -> Color.rgb(255, 160, 0)
                 else -> Color.rgb(30, 136, 229)
             }
-            canvas.drawRoundRect(rect, 22f, 22f, fillPaint)
+            canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
 
             if (unlocked) {
                 textPaint.color = Color.WHITE
-                textPaint.textSize = 34f
-                canvas.drawText("$lvl", rect.centerX(), rect.centerY() + 8f, textPaint)
+                textPaint.textSize = 28f * s
+                canvas.drawText("$lvl", tempRect.centerX(), tempRect.centerY() + 8f * s, textPaint)
                 if (isBossLvl) {
-                    textPaint.textSize = 16f
-                    canvas.drawText("БОСС", rect.centerX(), rect.bottom - 14f, textPaint)
+                    textPaint.textSize = 14f * s
+                    canvas.drawText("БОСС", tempRect.centerX(), tempRect.bottom - 12f * s, textPaint)
                 }
-                uiButtons.add(ButtonBox("select_level:$lvl", rect))
+                registerButton("select_level:$lvl", x, y, x + cellSize, y + cellSize)
             } else {
-                // Padlock icon
                 strokePaint.color = Color.rgb(144, 164, 174)
-                strokePaint.strokeWidth = 4f
-                tempRect.set(rect.centerX() - 14f, rect.centerY() - 26f, rect.centerX() + 14f, rect.centerY())
-                canvas.drawArc(tempRect, 180f, 180f, false, strokePaint)
+                strokePaint.strokeWidth = 3.5f * s
+                tempRect2.set(tempRect.centerX() - 12f * s, tempRect.centerY() - 22f * s, tempRect.centerX() + 12f * s, tempRect.centerY())
+                canvas.drawArc(tempRect2, 180f, 180f, false, strokePaint)
                 fillPaint.color = Color.rgb(144, 164, 174)
-                tempRect2.set(rect.centerX() - 18f, rect.centerY() - 10f, rect.centerX() + 18f, rect.centerY() + 18f)
-                canvas.drawRoundRect(tempRect2, 6f, 6f, fillPaint)
+                tempRect2.set(tempRect.centerX() - 15f * s, tempRect.centerY() - 8f * s, tempRect.centerX() + 15f * s, tempRect.centerY() + 16f * s)
+                canvas.drawRoundRect(tempRect2, 5f * s, 5f * s, fillPaint)
                 textPaint.color = Color.rgb(176, 190, 197)
-                textPaint.textSize = 18f
-                canvas.drawText("$lvl", rect.centerX(), rect.bottom - 12f, textPaint)
+                textPaint.textSize = 16f * s
+                canvas.drawText("$lvl", tempRect.centerX(), tempRect.bottom - 10f * s, textPaint)
             }
         }
 
-        // Page navigation
-        val navY = gridTop + 5 * (cellSize + gap) + 25f
+        val navY = gridTop + 5 * (cellSize + gap) + 20f * s
+        val navW = 200f * s
+        val navH = 66f * s
         if (levelPage > 0) {
-            drawMenuButton(canvas, "lvl_prev_page", "< Назад", 36f, navY, 240f, 76f, Color.rgb(69, 90, 100), Color.WHITE)
+            drawMenuButton(canvas, "lvl_prev_page", "< Назад", pad, navY, navW, navH, Color.rgb(69, 90, 100), Color.WHITE)
         }
-        drawMenuButton(canvas, "lvl_next_page", "Вперёд >", screenW - 276f, navY, 240f, 76f, Color.rgb(69, 90, 100), Color.WHITE)
+        drawMenuButton(canvas, "lvl_next_page", "Вперёд >", screenW - pad - navW, navY, navW, navH, Color.rgb(69, 90, 100), Color.WHITE)
     }
 
     private fun renderShop(canvas: Canvas) {
+        val s = uiScale
         fillPaint.color = Color.rgb(26, 22, 34)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        // 4 Tabs
+        // 4 крупные вкладки магазина
         val tabs = ShopTab.values()
-        val tabW = (screenW - 48f) / tabs.size
-        val tabTop = 148f
-        val tabH = 64f
+        val tabW = (screenW - 36f * s) / tabs.size
+        val tabTop = 114f * s
+        val tabH = 54f * s
         for (i in tabs.indices) {
             val t = tabs[i]
-            val tx = 24f + i * tabW
-            val rect = RectF(tx + 3f, tabTop, tx + tabW - 3f, tabTop + tabH)
+            val tx = 18f * s + i * tabW
+            val left = tx + 3f * s
+            val right = tx + tabW - 3f * s
+            tempRect.set(left, tabTop, right, tabTop + tabH)
             val active = (t == currentShopTab)
             fillPaint.color = if (active) Color.rgb(255, 160, 0) else Color.rgb(52, 46, 66)
-            canvas.drawRoundRect(rect, 16f, 16f, fillPaint)
+            canvas.drawRoundRect(tempRect, 14f * s, 14f * s, fillPaint)
             textPaint.color = if (active) Color.rgb(30, 15, 5) else Color.WHITE
-            textPaint.textSize = 22f
-            canvas.drawText(t.title, rect.centerX(), rect.centerY() + 8f, textPaint)
-            uiButtons.add(ButtonBox("shop_tab:${t.name}", rect))
+            textPaint.textSize = 18f * s
+            canvas.drawText(t.title, tempRect.centerX(), tempRect.centerY() + 6f * s, textPaint)
+            registerButton("shop_tab:${t.name}", left, tabTop, right, tabTop + tabH)
         }
 
-        val listTop = 228f
+        val listTop = 180f * s
         canvas.save()
         canvas.clipRect(0f, listTop, screenW, screenH)
 
-        var curY = listTop + 12f - scrollOffsetY
-        val cardH = 136f
-        val cardGap = 16f
+        var curY = listTop + 10f * s - scrollOffsetY
+        val cardH = 114f * s
+        val cardGap = 14f * s
 
         when (currentShopTab) {
             ShopTab.MUGS -> {
@@ -1525,31 +1559,30 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     }
                     val sub = if (!unlocked && skin.unlockAchievementId != null) {
                         val achName = Config.ACHIEVEMENTS.find { it.id == skin.unlockAchievementId }?.title ?: "Достижение"
-                        "Откроется за ачивку «$achName»"
+                        "За ачивку «$achName»"
                     } else {
-                        "Скин пивной кружки"
+                        "Скин кружки"
                     }
-                    drawShopCard(canvas, curY, cardH, skin.name, sub, btnLabel, btnColor, "buy_mug:${skin.id}") { cx, cy ->
-                        crowd.drawSingleMug(canvas, cx, cy + 36f, 54f, 74f, skin, totalTimeSec)
+                    drawShopCard(canvas, curY, cardH, listTop, skin.name, sub, btnLabel, btnColor, "buy_mug:${skin.id}") { cx, cy ->
+                        crowd.drawSingleMug(canvas, cx, cy + 28f * s, 44f * s, 60f * s, skin, totalTimeSec)
                     }
                     curY += cardH + cardGap
                 }
             }
             ShopTab.BOSSES -> {
-                // Auto option
                 val autoSel = prefs.selectedBossId == "auto"
                 drawShopCard(
-                    canvas, curY, cardH,
-                    "По уровню (Авто)", "Боссы меняются каждый уровень",
+                    canvas, curY, cardH, listTop,
+                    "По уровню (Авто)", "Смена каждый уровень",
                     if (autoSel) "Выбрано" else "Выбрать",
                     if (autoSel) Color.rgb(46, 125, 50) else Color.rgb(30, 136, 229),
                     "buy_boss:auto"
                 ) { cx, cy ->
                     fillPaint.color = Color.rgb(255, 193, 7)
-                    canvas.drawCircle(cx, cy, 30f, fillPaint)
+                    canvas.drawCircle(cx, cy, 24f * s, fillPaint)
                     textPaint.color = Color.BLACK
-                    textPaint.textSize = 24f
-                    canvas.drawText("AUTO", cx, cy + 8f, textPaint)
+                    textPaint.textSize = 18f * s
+                    canvas.drawText("AUTO", cx, cy + 6f * s, textPaint)
                 }
                 curY += cardH + cardGap
 
@@ -1567,19 +1600,18 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                         prefs.coins >= boss.price -> Color.rgb(255, 160, 0)
                         else -> Color.rgb(90, 90, 100)
                     }
-                    drawShopCard(canvas, curY, cardH, boss.name, "Облик финального босса", btnLabel, btnColor, "buy_boss:${boss.id}") { cx, cy ->
+                    drawShopCard(canvas, curY, cardH, listTop, boss.name, "Облик босса", btnLabel, btnColor, "buy_boss:${boss.id}") { cx, cy ->
                         fillPaint.color = boss.outfitColor
-                        canvas.drawCircle(cx, cy + 12f, 28f, fillPaint)
+                        canvas.drawCircle(cx, cy + 10f * s, 22f * s, fillPaint)
                         fillPaint.color = boss.skinColor
-                        canvas.drawCircle(cx, cy - 16f, 20f, fillPaint)
+                        canvas.drawCircle(cx, cy - 13f * s, 16f * s, fillPaint)
                         fillPaint.color = boss.accentColor
-                        canvas.drawCircle(cx, cy - 32f, 10f, fillPaint)
+                        canvas.drawCircle(cx, cy - 26f * s, 8f * s, fillPaint)
                     }
                     curY += cardH + cardGap
                 }
             }
             ShopTab.BOOSTERS -> {
-                // Постоянные улучшения
                 for (upg in Config.UpgradeType.values()) {
                     val lvl = prefs.getUpgradeLevel(upg)
                     val maxed = lvl >= upg.maxLevel
@@ -1591,37 +1623,36 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                         else -> Color.rgb(90, 90, 100)
                     }
                     drawShopCard(
-                        canvas, curY, cardH,
-                        "${upg.title} (Ур. $lvl/${upg.maxLevel})",
+                        canvas, curY, cardH, listTop,
+                        "${upg.title} (${lvl}/${upg.maxLevel})",
                         upg.desc,
                         btnLabel, btnColor,
                         "buy_upgrade:${upg.id}"
                     ) { cx, cy ->
                         fillPaint.color = Color.rgb(255, 215, 0)
-                        canvas.drawCircle(cx, cy, 30f, fillPaint)
+                        canvas.drawCircle(cx, cy, 24f * s, fillPaint)
                         textPaint.color = Color.rgb(40, 20, 5)
-                        textPaint.textSize = 26f
-                        canvas.drawText("UP", cx, cy + 9f, textPaint)
+                        textPaint.textSize = 20f * s
+                        canvas.drawText("UP", cx, cy + 7f * s, textPaint)
                     }
                     curY += cardH + cardGap
                 }
 
-                // Расходники
                 for (b in Config.BoosterType.values()) {
                     val cnt = prefs.getBoosterCount(b)
                     val btnColor = if (prefs.coins >= b.price) Color.rgb(255, 160, 0) else Color.rgb(90, 90, 100)
                     drawShopCard(
-                        canvas, curY, cardH,
-                        "${b.title} (Запас: x$cnt)",
+                        canvas, curY, cardH, listTop,
+                        "${b.title} (x$cnt)",
                         b.desc,
                         "${b.price} м.", btnColor,
                         "buy_booster:${b.id}"
                     ) { cx, cy ->
                         fillPaint.color = b.color
-                        canvas.drawCircle(cx, cy, 30f, fillPaint)
+                        canvas.drawCircle(cx, cy, 24f * s, fillPaint)
                         textPaint.color = Color.WHITE
-                        textPaint.textSize = 24f
-                        canvas.drawText("+1", cx, cy + 8f, textPaint)
+                        textPaint.textSize = 20f * s
+                        canvas.drawText("+1", cx, cy + 7f * s, textPaint)
                     }
                     curY += cardH + cardGap
                 }
@@ -1629,17 +1660,17 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             ShopTab.BACKGROUNDS -> {
                 val autoSel = prefs.selectedLocationId == "auto"
                 drawShopCard(
-                    canvas, curY, cardH,
-                    "Смена каждые 3 уровня", "Автоматическое путешествие по локациям",
+                    canvas, curY, cardH, listTop,
+                    "Смена каждые 3 уровня", "Авто-путешествие",
                     if (autoSel) "Выбрано" else "Выбрать",
                     if (autoSel) Color.rgb(46, 125, 50) else Color.rgb(30, 136, 229),
                     "buy_loc:auto"
                 ) { cx, cy ->
                     fillPaint.color = Color.rgb(0, 188, 212)
-                    canvas.drawCircle(cx, cy, 30f, fillPaint)
+                    canvas.drawCircle(cx, cy, 24f * s, fillPaint)
                     textPaint.color = Color.WHITE
-                    textPaint.textSize = 22f
-                    canvas.drawText("MIX", cx, cy + 8f, textPaint)
+                    textPaint.textSize = 18f * s
+                    canvas.drawText("MIX", cx, cy + 6f * s, textPaint)
                 }
                 curY += cardH + cardGap
 
@@ -1657,11 +1688,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                         prefs.coins >= loc.price -> Color.rgb(255, 160, 0)
                         else -> Color.rgb(90, 90, 100)
                     }
-                    drawShopCard(canvas, curY, cardH, loc.name, "Тематический фон и трасса", btnLabel, btnColor, "buy_loc:${loc.id}") { cx, cy ->
+                    drawShopCard(canvas, curY, cardH, listTop, loc.name, "Локация и трасса", btnLabel, btnColor, "buy_loc:${loc.id}") { cx, cy ->
                         fillPaint.color = loc.skyTop
-                        canvas.drawCircle(cx, cy, 32f, fillPaint)
+                        canvas.drawCircle(cx, cy, 26f * s, fillPaint)
                         fillPaint.color = loc.trackMain
-                        canvas.drawCircle(cx, cy + 12f, 18f, fillPaint)
+                        canvas.drawCircle(cx, cy + 10f * s, 14f * s, fillPaint)
                     }
                     curY += cardH + cardGap
                 }
@@ -1669,7 +1700,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
 
         val totalContentH = (curY + scrollOffsetY) - listTop
-        maxScrollY = (totalContentH - (screenH - listTop) + 40f).coerceAtLeast(0f)
+        maxScrollY = (totalContentH - (screenH - listTop) + 40f * s).coerceAtLeast(0f)
 
         canvas.restore()
         renderTopHeader(canvas, "МАГАЗИН")
@@ -1679,6 +1710,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         canvas: Canvas,
         y: Float,
         h: Float,
+        listTop: Float,
         title: String,
         subtitle: String,
         btnLabel: String,
@@ -1686,215 +1718,231 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         actionId: String,
         drawPreview: (Float, Float) -> Unit
     ) {
-        if (y + h < 180f || y > screenH) return
-        val cardRect = RectF(24f, y, screenW - 24f, y + h)
+        val s = uiScale
+        if (y + h < listTop || y > screenH) return
+        tempRect.set(18f * s, y, screenW - 18f * s, y + h)
         fillPaint.color = Color.rgb(42, 37, 56)
-        canvas.drawRoundRect(cardRect, 22f, 22f, fillPaint)
+        canvas.drawRoundRect(tempRect, 18f * s, 18f * s, fillPaint)
 
-        // Icon preview circle
+        val iconCx = 66f * s
         fillPaint.color = Color.rgb(30, 26, 40)
-        canvas.drawCircle(86f, y + h * 0.5f, 44f, fillPaint)
-        drawPreview(86f, y + h * 0.5f)
+        canvas.drawCircle(iconCx, y + h * 0.5f, 34f * s, fillPaint)
+        drawPreview(iconCx, y + h * 0.5f)
 
-        // Title & subtitle
         leftTextPaint.color = Color.WHITE
-        leftTextPaint.textSize = 25f
-        canvas.drawText(title, 148f, y + 52f, leftTextPaint)
+        leftTextPaint.textSize = 20f * s
+        canvas.drawText(title, 114f * s, y + 44f * s, leftTextPaint)
 
-        subTextPaint.color = Color.rgb(190, 195, 210)
-        subTextPaint.textSize = 20f
-        canvas.drawText(subtitle, 148f, y + 88f, subTextPaint)
+        subTextPaint.color = Color.rgb(195, 200, 215)
+        subTextPaint.textSize = 16f * s
+        canvas.drawText(subtitle, 114f * s, y + 76f * s, subTextPaint)
 
-        // Action button
-        val btnRect = RectF(screenW - 215f, y + 32f, screenW - 42f, y + h - 32f)
+        val btnLeft = screenW - 172f * s
+        val btnRight = screenW - 32f * s
+        val btnTop = y + 24f * s
+        val btnBottom = y + h - 24f * s
+        tempRect2.set(btnLeft, btnTop, btnRight, btnBottom)
         fillPaint.color = btnColor
-        canvas.drawRoundRect(btnRect, 18f, 18f, fillPaint)
+        canvas.drawRoundRect(tempRect2, 15f * s, 15f * s, fillPaint)
         textPaint.color = Color.WHITE
-        textPaint.textSize = 23f
-        canvas.drawText(btnLabel, btnRect.centerX(), btnRect.centerY() + 8f, textPaint)
+        textPaint.textSize = 19f * s
+        canvas.drawText(btnLabel, tempRect2.centerX(), tempRect2.centerY() + 7f * s, textPaint)
 
-        if (y + h > 228f) {
-            uiButtons.add(ButtonBox(actionId, btnRect))
+        if (btnBottom > listTop) {
+            registerButton(actionId, btnLeft, max(btnTop, listTop), btnRight, btnBottom)
         }
     }
 
     private fun renderAchievements(canvas: Canvas) {
+        val s = uiScale
         fillPaint.color = Color.rgb(22, 26, 38)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        val listTop = 148f
+        val listTop = 114f * s
         canvas.save()
         canvas.clipRect(0f, listTop, screenW, screenH)
 
-        var curY = listTop + 12f - scrollOffsetY
-        val cardH = 132f
-        val gap = 14f
+        var curY = listTop + 10f * s - scrollOffsetY
+        val cardH = 110f * s
+        val gap = 12f * s
 
         for (ach in Config.ACHIEVEMENTS) {
             val unlocked = prefs.isAchievementUnlocked(ach.id)
             val progress = prefs.getStat(ach.statKey).coerceAtMost(ach.target)
             if (curY + cardH >= listTop && curY <= screenH) {
-                val rect = RectF(24f, curY, screenW - 24f, curY + cardH)
+                tempRect.set(18f * s, curY, screenW - 18f * s, curY + cardH)
                 fillPaint.color = if (unlocked) Color.rgb(35, 68, 52) else Color.rgb(38, 44, 62)
-                canvas.drawRoundRect(rect, 20f, 20f, fillPaint)
+                canvas.drawRoundRect(tempRect, 18f * s, 18f * s, fillPaint)
 
-                // Status badge
                 fillPaint.color = if (unlocked) Color.rgb(105, 240, 174) else Color.rgb(84, 110, 122)
-                canvas.drawCircle(74f, curY + cardH * 0.5f, 28f, fillPaint)
+                canvas.drawCircle(58f * s, curY + cardH * 0.5f, 22f * s, fillPaint)
                 textPaint.color = Color.rgb(20, 30, 25)
-                textPaint.textSize = 26f
-                canvas.drawText(if (unlocked) "✓" else "★", 74f, curY + cardH * 0.5f + 9f, textPaint)
+                textPaint.textSize = 22f * s
+                canvas.drawText(if (unlocked) "✓" else "★", 58f * s, curY + cardH * 0.5f + 8f * s, textPaint)
 
                 leftTextPaint.color = Color.WHITE
-                leftTextPaint.textSize = 25f
-                canvas.drawText(ach.title, 120f, curY + 42f, leftTextPaint)
+                leftTextPaint.textSize = 20f * s
+                canvas.drawText(ach.title, 96f * s, curY + 35f * s, leftTextPaint)
 
                 subTextPaint.color = Color.rgb(200, 208, 220)
-                subTextPaint.textSize = 20f
-                canvas.drawText(ach.desc, 120f, curY + 72f, subTextPaint)
+                subTextPaint.textSize = 16f * s
+                canvas.drawText(ach.desc, 96f * s, curY + 60f * s, subTextPaint)
 
-                // Progress bar
-                val barLeft = 120f
-                val barRight = screenW - 190f
-                val barTop = curY + 88f
-                val barBottom = curY + 110f
+                val barLeft = 96f * s
+                val barRight = screenW - 152f * s
+                val barTop = curY + 74f * s
+                val barBottom = curY + 92f * s
                 fillPaint.color = Color.argb(140, 0, 0, 0)
                 tempRect.set(barLeft, barTop, barRight, barBottom)
-                canvas.drawRoundRect(tempRect, 11f, 11f, fillPaint)
+                canvas.drawRoundRect(tempRect, 9f * s, 9f * s, fillPaint)
 
                 val ratio = (progress.toFloat() / max(1, ach.target)).coerceIn(0f, 1f)
                 fillPaint.color = if (unlocked) Color.rgb(105, 240, 174) else Color.rgb(255, 193, 7)
                 tempRect.set(barLeft, barTop, barLeft + (barRight - barLeft) * ratio, barBottom)
-                canvas.drawRoundRect(tempRect, 11f, 11f, fillPaint)
+                canvas.drawRoundRect(tempRect, 9f * s, 9f * s, fillPaint)
 
                 textPaint.color = Color.rgb(255, 215, 0)
-                textPaint.textSize = 21f
-                canvas.drawText("+${ach.rewardCoins} м.", screenW - 105f, curY + 56f, textPaint)
+                textPaint.textSize = 18f * s
+                canvas.drawText("+${ach.rewardCoins} м.", screenW - 84f * s, curY + 46f * s, textPaint)
                 textPaint.color = Color.WHITE
-                textPaint.textSize = 19f
-                canvas.drawText("$progress/${ach.target}", screenW - 105f, curY + 104f, textPaint)
+                textPaint.textSize = 16f * s
+                canvas.drawText("$progress/${ach.target}", screenW - 84f * s, curY + 88f * s, textPaint)
             }
             curY += cardH + gap
         }
 
         val totalH = (curY + scrollOffsetY) - listTop
-        maxScrollY = (totalH - (screenH - listTop) + 40f).coerceAtLeast(0f)
+        maxScrollY = (totalH - (screenH - listTop) + 40f * s).coerceAtLeast(0f)
 
         canvas.restore()
         renderTopHeader(canvas, "АЧИВКИ (${Config.ACHIEVEMENTS.count { prefs.isAchievementUnlocked(it.id) }}/${Config.ACHIEVEMENTS.size})")
     }
 
     private fun renderTopHeader(canvas: Canvas, title: String) {
+        val s = uiScale
         fillPaint.color = Color.rgb(18, 20, 30)
-        canvas.drawRect(0f, 0f, screenW, 136f, fillPaint)
+        canvas.drawRect(0f, 0f, screenW, 106f * s, fillPaint)
 
-        val backRect = RectF(24f, 36f, 168f, 112f)
+        val backLeft = 18f * s
+        val backTop = 32f * s
+        val backRight = 148f * s
+        val backBottom = 94f * s
+        tempRect.set(backLeft, backTop, backRight, backBottom)
         fillPaint.color = Color.rgb(55, 65, 85)
-        canvas.drawRoundRect(backRect, 20f, 20f, fillPaint)
+        canvas.drawRoundRect(tempRect, 16f * s, 16f * s, fillPaint)
         textPaint.color = Color.WHITE
-        textPaint.textSize = 24f
-        canvas.drawText("< Меню", backRect.centerX(), backRect.centerY() + 8f, textPaint)
-        uiButtons.add(ButtonBox("back_menu", backRect))
+        textPaint.textSize = 20f * s
+        canvas.drawText("< Меню", tempRect.centerX(), tempRect.centerY() + 7f * s, textPaint)
+        registerButton("back_menu", backLeft, backTop, backRight, backBottom)
 
         textPaint.color = Color.WHITE
-        textPaint.textSize = 30f
-        canvas.drawText(title, screenW * 0.54f, 84f, textPaint)
+        textPaint.textSize = 24f * s
+        canvas.drawText(title, screenW * 0.54f, 70f * s, textPaint)
 
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 24f
-        canvas.drawText("${prefs.coins} м.", screenW - 76f, 84f, textPaint)
+        textPaint.textSize = 20f * s
+        canvas.drawText("${prefs.coins} м.", screenW - 64f * s, 70f * s, textPaint)
     }
 
     private fun renderPauseOverlay(canvas: Canvas) {
-        fillPaint.color = Color.argb(185, 10, 12, 20)
+        val s = uiScale
+        fillPaint.color = Color.argb(190, 10, 12, 20)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        val panelW = screenW - 120f
-        val panelH = 490f
-        val px = 60f
+        val panelW = screenW - 72f * s
+        val panelH = 400f * s
+        val px = 36f * s
         val py = (screenH - panelH) * 0.5f
         tempRect.set(px, py, px + panelW, py + panelH)
         fillPaint.color = Color.rgb(36, 40, 56)
-        canvas.drawRoundRect(tempRect, 32f, 32f, fillPaint)
+        canvas.drawRoundRect(tempRect, 26f * s, 26f * s, fillPaint)
 
         textPaint.color = Color.WHITE
-        textPaint.textSize = 46f
-        canvas.drawText("ПАУЗА", screenW * 0.5f, py + 82f, textPaint)
+        textPaint.textSize = 36f * s
+        canvas.drawText("ПАУЗА", screenW * 0.5f, py + 66f * s, textPaint)
 
-        val btnW = panelW - 80f
-        val btnH = 84f
-        drawMenuButton(canvas, "pause_resume", "Продолжить", px + 40f, py + 130f, btnW, btnH, Color.rgb(67, 160, 71), Color.WHITE)
-        drawMenuButton(canvas, "pause_restart", "Заново", px + 40f, py + 236f, btnW, btnH, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
-        drawMenuButton(canvas, "pause_menu", "В главное меню", px + 40f, py + 342f, btnW, btnH, Color.rgb(229, 57, 53), Color.WHITE)
+        val btnW = panelW - 56f * s
+        val btnH = 72f * s
+        drawMenuButton(canvas, "pause_resume", "Продолжить", px + 28f * s, py + 104f * s, btnW, btnH, Color.rgb(67, 160, 71), Color.WHITE)
+        drawMenuButton(canvas, "pause_restart", "Заново", px + 28f * s, py + 194f * s, btnW, btnH, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
+        drawMenuButton(canvas, "pause_menu", "В главное меню", px + 28f * s, py + 284f * s, btnW, btnH, Color.rgb(229, 57, 53), Color.WHITE)
     }
 
     private fun renderWinOverlay(canvas: Canvas) {
-        fillPaint.color = Color.argb(175, 12, 24, 18)
+        val s = uiScale
+        fillPaint.color = Color.argb(180, 12, 24, 18)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        val panelW = screenW - 100f
-        val panelH = 520f
-        val px = 50f
+        val panelW = screenW - 64f * s
+        val panelH = 420f * s
+        val px = 32f * s
         val py = (screenH - panelH) * 0.5f
         tempRect.set(px, py, px + panelW, py + panelH)
         fillPaint.color = Color.rgb(30, 52, 42)
-        canvas.drawRoundRect(tempRect, 32f, 32f, fillPaint)
+        canvas.drawRoundRect(tempRect, 26f * s, 26f * s, fillPaint)
 
         textPaint.color = Color.rgb(105, 240, 174)
-        textPaint.textSize = 50f
-        canvas.drawText("ПОБЕДА!", screenW * 0.5f, py + 86f, textPaint)
+        textPaint.textSize = 40f * s
+        canvas.drawText("ПОБЕДА!", screenW * 0.5f, py + 70f * s, textPaint)
 
         textPaint.color = Color.WHITE
-        textPaint.textSize = 28f
-        canvas.drawText("Босс повержен! Осталось кружек: ${crowd.count}", screenW * 0.5f, py + 146f, textPaint)
+        textPaint.textSize = 22f * s
+        canvas.drawText("Босс повержен! Осталось кружек: ${crowd.count}", screenW * 0.5f, py + 120f * s, textPaint)
 
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 34f
-        canvas.drawText("Награда: +$runCoinsEarned монет", screenW * 0.5f, py + 202f, textPaint)
+        textPaint.textSize = 27f * s
+        canvas.drawText("Награда: +$runCoinsEarned монет", screenW * 0.5f, py + 166f * s, textPaint)
 
-        val btnW = panelW - 80f
-        drawMenuButton(canvas, "win_next", "Следующий уровень", px + 40f, py + 265f, btnW, 88f, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
-        drawMenuButton(canvas, "win_menu", "В главное меню", px + 40f, py + 375f, btnW, 82f, Color.rgb(69, 90, 100), Color.WHITE)
+        val btnW = panelW - 56f * s
+        drawMenuButton(canvas, "win_next", "Следующий уровень", px + 28f * s, py + 212f * s, btnW, 76f * s, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
+        drawMenuButton(canvas, "win_menu", "В главное меню", px + 28f * s, py + 306f * s, btnW, 70f * s, Color.rgb(69, 90, 100), Color.WHITE)
     }
 
     private fun renderLoseOverlay(canvas: Canvas) {
-        fillPaint.color = Color.argb(185, 28, 12, 14)
+        val s = uiScale
+        fillPaint.color = Color.argb(190, 28, 12, 14)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        val panelW = screenW - 100f
-        val panelH = 480f
-        val px = 50f
+        val panelW = screenW - 64f * s
+        val panelH = 390f * s
+        val px = 32f * s
         val py = (screenH - panelH) * 0.5f
         tempRect.set(px, py, px + panelW, py + panelH)
         fillPaint.color = Color.rgb(54, 28, 34)
-        canvas.drawRoundRect(tempRect, 32f, 32f, fillPaint)
+        canvas.drawRoundRect(tempRect, 26f * s, 26f * s, fillPaint)
 
         textPaint.color = Color.rgb(255, 82, 82)
-        textPaint.textSize = 48f
-        canvas.drawText("НЕ ХВАТИЛО ПЕНЫ!", screenW * 0.5f, py + 86f, textPaint)
+        textPaint.textSize = 36f * s
+        canvas.drawText("НЕ ХВАТИЛО ПЕНЫ!", screenW * 0.5f, py + 70f * s, textPaint)
 
         textPaint.color = Color.rgb(230, 220, 220)
-        textPaint.textSize = 25f
-        canvas.drawText("Собирай больше кружек через x и +", screenW * 0.5f, py + 148f, textPaint)
+        textPaint.textSize = 20f * s
+        canvas.drawText("Собирай больше кружек через x и +", screenW * 0.5f, py + 120f * s, textPaint)
 
-        val btnW = panelW - 80f
-        drawMenuButton(canvas, "lose_retry", "Попробовать заново", px + 40f, py + 225f, btnW, 88f, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
-        drawMenuButton(canvas, "lose_menu", "В главное меню", px + 40f, py + 335f, btnW, 82f, Color.rgb(69, 90, 100), Color.WHITE)
+        val btnW = panelW - 56f * s
+        drawMenuButton(canvas, "lose_retry", "Попробовать заново", px + 28f * s, py + 178f * s, btnW, 76f * s, Color.rgb(255, 160, 0), Color.rgb(35, 18, 5))
+        drawMenuButton(canvas, "lose_menu", "В главное меню", px + 28f * s, py + 272f * s, btnW, 70f * s, Color.rgb(69, 90, 100), Color.WHITE)
     }
 
     private fun renderParticlesAndTexts(canvas: Canvas) {
+        val s = uiScale
         for (p in particles) {
             if (p.active) {
                 val alpha = ((p.life / p.maxLife) * 255).toInt().coerceIn(0, 255)
                 fillPaint.color = Color.argb(alpha, Color.red(p.color), Color.green(p.color), Color.blue(p.color))
-                canvas.drawCircle(p.x, p.y, p.radius, fillPaint)
+                canvas.drawCircle(p.x, p.y, p.radius * s * 0.85f, fillPaint)
             }
         }
+        val fSize = 27f * s
+        textOutlinePaint.textSize = fSize
+        textOutlinePaint.strokeWidth = 4.5f * s
+        textPaint.textSize = fSize
         for (ft in floatingTexts) {
             if (ft.active) {
                 val alpha = ((ft.life / ft.maxLife) * 255).toInt().coerceIn(0, 255)
+                textOutlinePaint.color = Color.argb(alpha, 15, 15, 20)
                 textPaint.color = Color.argb(alpha, Color.red(ft.color), Color.green(ft.color), Color.blue(ft.color))
-                textPaint.textSize = 30f
+                canvas.drawText(ft.text, ft.x, ft.y, textOutlinePaint)
                 canvas.drawText(ft.text, ft.x, ft.y, textPaint)
             }
         }
@@ -1902,24 +1950,26 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     private fun renderAchievementBanner(canvas: Canvas) {
         if (bannerTimer <= 0f) return
+        val s = uiScale
         val slide = min(1f, bannerTimer * 3f) * min(1f, (3.5f - bannerTimer) * 5f + 0.2f)
-        val top = -110f + 135f * slide
-        tempRect.set(40f, top, screenW - 40f, top + 96f)
+        val bannerH = 82f * s
+        val top = -bannerH - 10f + (bannerH + 34f * s) * slide
+        tempRect.set(28f * s, top, screenW - 28f * s, top + bannerH)
         fillPaint.color = Color.rgb(46, 125, 50)
-        canvas.drawRoundRect(tempRect, 24f, 24f, fillPaint)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
         strokePaint.color = Color.rgb(255, 215, 0)
-        strokePaint.strokeWidth = 4f
-        canvas.drawRoundRect(tempRect, 24f, 24f, strokePaint)
+        strokePaint.strokeWidth = 3f * s
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, strokePaint)
 
         textPaint.color = Color.WHITE
-        textPaint.textSize = 26f
-        canvas.drawText(bannerTitle, screenW * 0.5f, top + 40f, textPaint)
+        textPaint.textSize = 21f * s
+        canvas.drawText(bannerTitle, screenW * 0.5f, top + 34f * s, textPaint)
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 22f
-        canvas.drawText(bannerReward, screenW * 0.5f, top + 74f, textPaint)
+        textPaint.textSize = 18f * s
+        canvas.drawText(bannerReward, screenW * 0.5f, top + 62f * s, textPaint)
     }
 
-    // ==================== INPUT HANDLING ====================
+    // ==================== INSTANT INPUT HANDLING ====================
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val x = event.x
@@ -1927,12 +1977,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                touchDownX = x
-                touchDownY = y
                 lastTouchX = x
                 lastTouchY = y
                 touchMovedDist = 0f
                 isDraggingScroll = false
+
+                // Мгновенный клик на ACTION_DOWN без задержки на отпускание пальца!
+                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
+                if (!isScrollableScreen || y < 180f * uiScale) {
+                    handleTap(x, y)
+                }
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -1946,7 +2000,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     val sensitivity = 2.35f / screenW
                     crowd.centerX += dx * sensitivity
                 } else if (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS) {
-                    if (touchMovedDist > 18f) {
+                    if (touchMovedDist > 24f * uiScale) {
                         isDraggingScroll = true
                         scrollOffsetY = (scrollOffsetY - dy).coerceIn(0f, maxScrollY)
                     }
@@ -1954,7 +2008,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (!isDraggingScroll && touchMovedDist < 28f) {
+                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
+                if (isScrollableScreen && y >= 180f * uiScale && !isDraggingScroll && touchMovedDist < 42f * uiScale) {
                     handleTap(x, y)
                 }
                 isDraggingScroll = false
@@ -1964,15 +2019,17 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         return super.onTouchEvent(event)
     }
 
-    private fun handleTap(x: Float, y: Float) {
-        for (i in uiButtons.size - 1 downTo 0) {
-            val btn = uiButtons[i]
+    private fun handleTap(x: Float, y: Float): Boolean {
+        val snapshot = readableButtons
+        for (i in snapshot.size - 1 downTo 0) {
+            val btn = snapshot[i]
             if (btn.rect.contains(x, y)) {
                 sound.playClick()
                 executeButtonAction(btn.id)
-                return
+                return true
             }
         }
+        return false
     }
 
     private fun executeButtonAction(id: String) {
