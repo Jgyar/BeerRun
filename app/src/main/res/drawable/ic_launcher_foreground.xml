@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+android:width="108dp"
+android:height="108dp"
+android:viewportWidth="108"
+android:viewportHeight="108">
+​<!-- Ручка кружки -->
+<path
+android:fillColor="#00000000"
+android:strokeColor="#E0E0E0"
+android:strokeWidth="6"
+android:strokeLineCap="round"
+android:pathData="M67,46 L76,46 Q82,46 82,53 L82,66 Q82,73 76,73 L67,73" />
+​<!-- Тёмно-золотой корпус кружки -->
+<path
+android:fillColor="#F59E0B"
+android:pathData="M36,40 L68,40 Q71,40 71,43 L71,76 Q71,82 65,82 L39,82 Q33,82 33,76 L33,43 Q33,40 36,40 Z" />
+​<!-- Ярко-золотая центральная часть пива -->
+<path
+android:fillColor="#FBBF24"
+android:pathData="M37,42 L67,42 L67,76 Q67,78 65,78 L39,78 Q37,78 37,76 Z" />
+​<!-- Вертикальные рёбра стекла -->
+<path
+android:fillColor="#D97706"
+android:pathData="M42,48 L45,48 L45,74 L42,74 Z" />
+<path
+android:fillColor="#D97706"
+android:pathData="M50,48 L53,48 L53,74 L50,74 Z" />
+​<!-- Белый глянцевый блик на стекле -->
+<path
+android:fillColor="#FEF3C7"
+android:pathData="M60,46 L64,46 L64,74 L60,74 Z" />
+​<!-- Пышная белая шапка пены -->
+<path
+android:fillColor="#FFFFFF"
+android:pathData="M31,37
+A8,8 0 0,1 41,28
+A10,10 0 0,1 58,27
+A9,9 0 0,1 72,35
+A6,6 0 0,1 70,44
+L34,44
+A6,6 0 0,1 31,37 Z" />
+​<!-- Стекающая капля пены -->
+<path
+android:fillColor="#FFFFFF"
+android:pathData="M36,41 L42,41 L42,54 Q42,57 39,57 Q36,57 36,54 Z" />
+​<!-- Вторая маленькая капля пены -->
+<path
+android:fillColor="#FFFFFF"
+android:pathData="M45,41 L49,41 L49,49 Q49,51 47,51 Q45,51 45,49 Z" />
+</vector>
