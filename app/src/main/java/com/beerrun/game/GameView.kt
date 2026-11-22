@@ -1,6 +1,10 @@
 package com.beerrun.game
 
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -8,9 +12,14 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Shader
+import android.net.Uri
+import android.text.InputType
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
@@ -20,11 +29,20 @@ import kotlin.random.Random
 
 class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback, Runnable {
 
+    companion object {
+        private const val VIEW_DIST = 1250f
+        private const val HORIZON_RATIO = 0.34f
+        private const val PLAYER_BASE_Y_RATIO = 0.77f
+        // Точное смещение Z, соответствующее экранной позиции толпы (77% высоты экрана)
+        private const val CROWD_VISUAL_REL_Z = 270f
+    }
+
     enum class ScreenState {
         MENU,
         LEVEL_SELECT,
         SHOP,
         ACHIEVEMENTS,
+        ACCOUNT,
         PLAYING,
         PAUSED,
         WIN,
@@ -90,6 +108,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     @Volatile
     private var state = ScreenState.MENU
     private var currentShopTab = ShopTab.MUGS
+
+    // Account screen feedback state
+    @Volatile
+    private var accountStatusText = ""
+    @Volatile
+    private var accountStatusColor = Color.rgb(105, 240, 174)
+    @Volatile
+    private var isCloudBusy = false
 
     // Scroll & pagination states for UI screens
     private var scrollOffsetY = 0f
@@ -229,7 +255,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 state = ScreenState.PLAYING
                 true
             }
-            ScreenState.SHOP, ScreenState.LEVEL_SELECT, ScreenState.ACHIEVEMENTS -> {
+            ScreenState.SHOP, ScreenState.LEVEL_SELECT, ScreenState.ACHIEVEMENTS, ScreenState.ACCOUNT -> {
                 sound.playClick()
                 scrollOffsetY = 0f
                 state = ScreenState.MENU
@@ -402,11 +428,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         val slowMul = if (slowTimer > 0f) 0.55f else 1.0f
         playerZ += Config.BASE_RUN_SPEED * startRamp * slowMul * dt
 
+        // Координата Z самой толпы кружек на трассе (совпадает с визуальной позицией на экране)
+        val crowdZ = playerZ + CROWD_VISUAL_REL_Z
+
         prefs.setStatMax("max_mugs_run", crowd.count)
 
-        // 1. Проверка рамок (Gates)
+        // 1. Проверка рамок (Gates) — срабатывает мгновенно в момент касания кружками
         for (row in data.gateRows) {
-            if (!row.triggered && playerZ >= row.z) {
+            if (!row.triggered && crowdZ >= row.z - 10f) {
                 row.triggered = true
                 handleGateRowCollision(row)
                 if (crowd.count <= 0) {
@@ -419,16 +448,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         // 2. Проверка подбираемых предметов
         for (pickup in data.pickups) {
             if (pickup.collected) continue
-            val dz = pickup.z - playerZ
-            if (crowd.hasMagnet && dz in -40f..380f) {
-                pickup.x += (crowd.centerX - pickup.x) * (dt * 7f).coerceIn(0f, 1f)
+            val dz = pickup.z - crowdZ
+            if (crowd.hasMagnet && dz in -40f..420f) {
+                pickup.x += (crowd.centerX - pickup.x) * (dt * 8f).coerceIn(0f, 1f)
             }
-            if (abs(dz) < 38f && abs(pickup.x - crowd.centerX) <= crowd.crowdRadius + 0.24f) {
+            if (abs(dz) < 42f && abs(pickup.x - crowd.centerX) <= crowd.crowdRadius + 0.26f) {
                 pickup.collected = true
                 sound.playPickup()
                 if (pickup.type == PickupType.BONUS_MUG) {
                     crowd.addCount(pickup.value)
-                    spawnFloatingText("+${pickup.value} кружек", crowd.centerX, screenH * 0.64f, Color.rgb(255, 224, 130))
+                    spawnFloatingText("+${pickup.value} кружек", crowd.centerX, screenH * 0.62f, Color.rgb(255, 224, 130))
                     spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(255, 213, 79), 10)
                 } else {
                     val gained = computeCoinGain(pickup.value)
@@ -436,7 +465,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                     prefs.coins += gained
                     prefs.addStat("coins_total", gained)
                     prefs.addStat("chests_opened", 1)
-                    spawnFloatingText("+$gained монет", crowd.centerX, screenH * 0.62f, Color.rgb(255, 215, 0))
+                    spawnFloatingText("+$gained монет", crowd.centerX, screenH * 0.60f, Color.rgb(255, 215, 0))
                     spawnBurst(screenW * 0.5f + crowd.centerX * (screenW * 0.36f), screenH * 0.72f, Color.rgb(255, 215, 0), 14)
                     checkAndShowAchievements()
                 }
@@ -449,14 +478,14 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 obs.hitTimer = (obs.hitTimer - dt).coerceAtLeast(0f)
             }
             if (obs.type == ObstacleType.NARROW_BRIDGE) {
-                if (playerZ in obs.z..(obs.z + obs.lengthZ) && obs.hitTimer <= 0f) {
+                if (crowdZ in obs.z..(obs.z + obs.lengthZ) && obs.hitTimer <= 0f) {
                     if (abs(crowd.centerX) > obs.halfWidth) {
                         obs.hitTimer = 0.32f
                         val lost = max(1, (crowd.count * 0.14f).toInt())
                         crowd.addCount(-lost)
                         runHitTrap = true
                         sound.playTrap()
-                        spawnFloatingText("-$lost (край моста!)", crowd.centerX, screenH * 0.64f, Color.rgb(255, 112, 67))
+                        spawnFloatingText("-$lost (край моста!)", crowd.centerX, screenH * 0.62f, Color.rgb(255, 112, 67))
                         if (crowd.count <= 0) {
                             triggerLose()
                             return
@@ -466,7 +495,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
                 continue
             }
 
-            if (!obs.triggered && abs(obs.z - playerZ) < 34f) {
+            if (!obs.triggered && abs(obs.z - crowdZ) < 36f) {
                 val ox = obs.currentX(totalTimeSec)
                 if (abs(ox - crowd.centerX) < (obs.halfWidth + crowd.crowdRadius * 0.65f)) {
                     obs.triggered = true
@@ -482,7 +511,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         // 4. Проверка человечков-противников
         for (enemy in data.enemies) {
             if (enemy.defeated) continue
-            if (abs(enemy.z - playerZ) < 42f) {
+            if (abs(enemy.z - crowdZ) < 44f) {
                 val ex = enemy.currentX(totalTimeSec)
                 if (abs(ex - crowd.centerX) < (crowd.crowdRadius + 0.28f)) {
                     handleEnemyClash(enemy)
@@ -496,16 +525,16 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
         // 5. Проверка мини-босса
         val mini = data.miniBoss
-        if (mini != null && !mini.defeated && playerZ >= mini.z - 55f) {
-            playerZ = mini.z - 55f
+        if (mini != null && !mini.defeated && crowdZ >= mini.z - 60f) {
+            playerZ = mini.z - 60f - CROWD_VISUAL_REL_Z
             activeBossFight = mini
             gulpAccumulator = 0f
             return
         }
 
         // 6. Проверка финального босса
-        if (playerZ >= data.mainBoss.z - 75f) {
-            playerZ = data.mainBoss.z - 75f
+        if (crowdZ >= data.mainBoss.z - 75f) {
+            playerZ = data.mainBoss.z - 75f - CROWD_VISUAL_REL_Z
             activeBossFight = data.mainBoss
             gulpAccumulator = 0f
         }
@@ -515,10 +544,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         val offsetX = row.getOffsetX(totalTimeSec)
         var chosen: GateItem? = null
         var bestDist = Float.MAX_VALUE
+        val reachBonus = max(0.16f, crowd.crowdRadius * 0.65f)
         for (g in row.gates) {
             val gx = g.laneCenter + offsetX
             val dist = abs(gx - crowd.centerX)
-            if (dist <= g.halfWidth + 0.14f && dist < bestDist) {
+            if (dist <= g.halfWidth + reachBonus && dist < bestDist) {
                 bestDist = dist
                 chosen = g
             }
@@ -698,6 +728,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         levelPage = (nextLvl - 1) / 20
 
         checkAndShowAchievements()
+
+        // Фоновая синхронизация с GitHub Gist, если токен привязан
+        if (prefs.githubToken.isNotEmpty()) {
+            prefs.saveToGitHubGist { _, _ -> }
+        }
+
         state = ScreenState.WIN
     }
 
@@ -844,6 +880,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             ScreenState.LEVEL_SELECT -> renderLevelSelect(canvas)
             ScreenState.SHOP -> renderShop(canvas)
             ScreenState.ACHIEVEMENTS -> renderAchievements(canvas)
+            ScreenState.ACCOUNT -> renderAccount(canvas)
             ScreenState.PLAYING -> renderGameplay(canvas)
             ScreenState.PAUSED -> {
                 renderGameplay(canvas)
@@ -881,7 +918,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
         drawLocationSkyDecor(canvas, loc)
 
-        val horizonY = screenH * 0.34f
+        val horizonY = screenH * HORIZON_RATIO
         fillPaint.color = loc.sideColor
         canvas.drawRect(0f, horizonY, screenW, screenH, fillPaint)
 
@@ -898,8 +935,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         fillPaint.color = loc.trackMain
         canvas.drawPath(tempPath, fillPaint)
 
-        // Увеличенная дистанция обзора (1250 вместо 920), чтобы заранее видеть рамки
-        val viewDist = 1250f
+        val viewDist = VIEW_DIST
         val stripeStep = 140f
         val firstStripeIdx = (playerZ / stripeStep).toInt()
         for (idx in firstStripeIdx..(firstStripeIdx + 10)) {
@@ -1105,8 +1141,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
 
         // Толпа кружек игрока
-        val playerBaseY = screenH * 0.77f
-        val playerTrackHalfPx = topHalfW + (bottomHalfW - topHalfW) * projectDepth(110f, viewDist)
+        val playerBaseY = screenH * PLAYER_BASE_Y_RATIO
+        val playerTrackHalfPx = topHalfW + (bottomHalfW - topHalfW) * projectDepth(CROWD_VISUAL_REL_Z, viewDist)
         crowd.draw(canvas, cx, playerBaseY, playerTrackHalfPx, mugSkin, totalTimeSec)
 
         for (fm in flyingMugs) {
@@ -1274,7 +1310,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         // Полоса прогресса уровня
         val progY = topY + hudH + 14f * s
         val progH = 12f * s
-        val prog = (playerZ / max(1f, data.trackLength)).coerceIn(0f, 1f)
+        val prog = (playerZ / max(1f, data.trackLength - CROWD_VISUAL_REL_Z)).coerceIn(0f, 1f)
         fillPaint.color = Color.argb(150, 255, 255, 255)
         tempRect.set(screenW * 0.20f, progY, screenW * 0.80f, progY + progH)
         canvas.drawRoundRect(tempRect, progH * 0.5f, progH * 0.5f, fillPaint)
@@ -1318,14 +1354,15 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         fillPaint.color = Color.argb(42, 255, 193, 7)
         canvas.drawCircle(screenW * 0.5f, screenH * 0.26f, screenW * 0.54f, fillPaint)
 
-        // Крупная верхняя панель: Монеты и Звук
+        // Верхняя панель: Монеты | Аккаунт / Облако | Звук
         val topY = 42f * s
         val pillH = 62f * s
+        val coinRight = 236f * s
         fillPaint.color = Color.argb(205, 58, 40, 32)
-        tempRect.set(24f * s, topY, 260f * s, topY + pillH)
+        tempRect.set(24f * s, topY, coinRight, topY + pillH)
         canvas.drawRoundRect(tempRect, 31f * s, 31f * s, fillPaint)
         textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 23f * s
+        textPaint.textSize = 21f * s
         canvas.drawText("Монеты: ${prefs.coins}", tempRect.centerX(), topY + pillH * 0.63f, textPaint)
 
         val muteLeft = screenW - 125f * s
@@ -1337,6 +1374,27 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         textPaint.textSize = 20f * s
         canvas.drawText(if (sound.muted) "ВЫКЛ" else "ЗВУК", tempRect.centerX(), topY + pillH * 0.63f, textPaint)
         registerButton("toggle_mute", muteLeft, topY, muteRight, topY + pillH)
+
+        // Кнопка привязки аккаунта / облака по центру верхней панели
+        val accLeft = coinRight + 12f * s
+        val accRight = muteLeft - 12f * s
+        val isLinked = prefs.githubToken.isNotEmpty()
+        fillPaint.color = if (isLinked) Color.rgb(32, 92, 62) else Color.rgb(44, 68, 96)
+        tempRect.set(accLeft, topY, accRight, topY + pillH)
+        canvas.drawRoundRect(tempRect, 24f * s, 24f * s, fillPaint)
+        strokePaint.color = if (isLinked) Color.rgb(105, 240, 174) else Color.rgb(100, 181, 246)
+        strokePaint.strokeWidth = 2.5f * s
+        canvas.drawRoundRect(tempRect, 24f * s, 24f * s, strokePaint)
+
+        val accLabel = when {
+            prefs.githubUserLogin.isNotEmpty() -> "@${prefs.githubUserLogin}"
+            isLinked -> "ОБЛАКО: ОК"
+            else -> "АККАУНТ"
+        }
+        textPaint.color = Color.WHITE
+        textPaint.textSize = 20f * s
+        canvas.drawText(accLabel, tempRect.centerX(), topY + pillH * 0.63f, textPaint)
+        registerButton("open_account", accLeft, topY, accRight, topY + pillH)
 
         // Крупный заголовок игры
         textPaint.color = Color.rgb(255, 193, 7)
@@ -1416,6 +1474,163 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         drawMenuButton(canvas, "open_achievements", "АЧИВКИ", btnX, btnStartY + (btnH + gap) * 2.90f, btnW, btnH * 0.92f, Color.rgb(142, 36, 170), Color.WHITE)
     }
 
+    private fun renderAccount(canvas: Canvas) {
+        val s = uiScale
+        fillPaint.color = Color.rgb(22, 26, 38)
+        canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
+
+        val pad = 24f * s
+        val cardW = screenW - pad * 2f
+        var curY = 122f * s
+
+        // Карточка текущего прогресса и статуса операции
+        val statusH = if (accountStatusText.isNotEmpty()) 112f * s else 80f * s
+        tempRect.set(pad, curY, pad + cardW, curY + statusH)
+        fillPaint.color = Color.rgb(34, 42, 60)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
+
+        val unlockedAch = Config.ACHIEVEMENTS.count { prefs.isAchievementUnlocked(it.id) }
+        textPaint.color = Color.WHITE
+        textPaint.textSize = 21f * s
+        canvas.drawText(
+            "Прогресс: Ур. ${prefs.level} • ${prefs.coins} м. • Ачивок $unlockedAch/${Config.ACHIEVEMENTS.size}",
+            screenW * 0.5f,
+            curY + 42f * s,
+            textPaint
+        )
+        if (accountStatusText.isNotEmpty()) {
+            textPaint.color = accountStatusColor
+            textPaint.textSize = 19f * s
+            canvas.drawText(accountStatusText, screenW * 0.5f, curY + 86f * s, textPaint)
+        }
+        curY += statusH + 18f * s
+
+        // Секция 1: Облако GitHub Gist
+        val hasToken = prefs.githubToken.isNotEmpty()
+        val ghBoxH = if (hasToken) 425f * s else 355f * s
+        tempRect.set(pad, curY, pad + cardW, curY + ghBoxH)
+        fillPaint.color = Color.rgb(32, 38, 54)
+        canvas.drawRoundRect(tempRect, 22f * s, 22f * s, fillPaint)
+        strokePaint.color = if (hasToken) Color.rgb(105, 240, 174) else Color.rgb(66, 165, 245)
+        strokePaint.strokeWidth = 2.5f * s
+        canvas.drawRoundRect(tempRect, 22f * s, 22f * s, strokePaint)
+
+        leftTextPaint.color = Color.rgb(129, 212, 250)
+        leftTextPaint.textSize = 24f * s
+        canvas.drawText("1. Облако GitHub (Автосохранение)", pad + 22f * s, curY + 42f * s, leftTextPaint)
+
+        subTextPaint.color = Color.rgb(210, 218, 230)
+        subTextPaint.textSize = 18f * s
+        val ghStatusLine = if (hasToken) {
+            val userPart = if (prefs.githubUserLogin.isNotEmpty()) "@${prefs.githubUserLogin}" else "Токен привязан"
+            val syncPart = if (prefs.lastCloudSync.isNotEmpty()) " • Синхр: ${prefs.lastCloudSync}" else ""
+            "Аккаунт: $userPart$syncPart"
+        } else {
+            "Привяжи GitHub Token (право gist), чтобы не терять прогресс"
+        }
+        canvas.drawText(ghStatusLine, pad + 22f * s, curY + 74f * s, subTextPaint)
+
+        val innerX = pad + 22f * s
+        val innerW = cardW - 44f * s
+        val btnH = 66f * s
+
+        drawMenuButton(
+            canvas,
+            "gh_set_token",
+            if (hasToken) "Изменить GitHub Token" else "Привязать GitHub Token",
+            innerX,
+            curY + 96f * s,
+            innerW,
+            btnH,
+            Color.rgb(30, 136, 229),
+            Color.WHITE
+        )
+
+        val cloudBtnAlpha = if (hasToken && !isCloudBusy) 255 else 120
+        drawMenuButton(
+            canvas,
+            "gh_save",
+            if (isCloudBusy) "Синхронизация..." else "Сохранить в GitHub",
+            innerX,
+            curY + 176f * s,
+            innerW,
+            btnH,
+            Color.argb(cloudBtnAlpha, 46, 125, 50),
+            Color.WHITE
+        )
+
+        drawMenuButton(
+            canvas,
+            "gh_load",
+            "Загрузить из GitHub",
+            innerX,
+            curY + 256f * s,
+            innerW,
+            btnH,
+            Color.argb(cloudBtnAlpha, 255, 160, 0),
+            Color.rgb(35, 18, 5)
+        )
+
+        if (hasToken) {
+            drawMenuButton(
+                canvas,
+                "gh_unlink",
+                "Отвязать GitHub",
+                innerX,
+                curY + 336f * s,
+                innerW,
+                56f * s,
+                Color.rgb(90, 42, 48),
+                Color.rgb(255, 180, 180)
+            )
+        }
+
+        curY += ghBoxH + 20f * s
+
+        // Секция 2: Код переноса (работает без интернета)
+        val codeBoxH = 264f * s
+        tempRect.set(pad, curY, pad + cardW, curY + codeBoxH)
+        fillPaint.color = Color.rgb(32, 38, 54)
+        canvas.drawRoundRect(tempRect, 22f * s, 22f * s, fillPaint)
+        strokePaint.color = Color.rgb(255, 193, 7)
+        strokePaint.strokeWidth = 2.5f * s
+        canvas.drawRoundRect(tempRect, 22f * s, 22f * s, strokePaint)
+
+        leftTextPaint.color = Color.rgb(255, 213, 79)
+        leftTextPaint.textSize = 24f * s
+        canvas.drawText("2. Код переноса (Без интернета)", pad + 22f * s, curY + 42f * s, leftTextPaint)
+
+        subTextPaint.color = Color.rgb(210, 218, 230)
+        subTextPaint.textSize = 18f * s
+        canvas.drawText("Сохрани код в заметки, чтобы восстановить игру в любой момент", pad + 22f * s, curY + 74f * s, subTextPaint)
+
+        drawMenuButton(
+            canvas,
+            "code_copy",
+            "Скопировать код сохранения",
+            innerX,
+            curY + 98f * s,
+            innerW,
+            btnH,
+            Color.rgb(255, 160, 0),
+            Color.rgb(35, 18, 5)
+        )
+
+        drawMenuButton(
+            canvas,
+            "code_paste",
+            "Вставить код сохранения",
+            innerX,
+            curY + 178f * s,
+            innerW,
+            btnH,
+            Color.rgb(142, 36, 170),
+            Color.WHITE
+        )
+
+        renderTopHeader(canvas, "АККАУНТ")
+    }
+
     private fun drawMenuButton(
         canvas: Canvas,
         id: String,
@@ -1436,8 +1651,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         canvas.drawRoundRect(tempRect, 24f * s, 24f * s, strokePaint)
 
         textPaint.color = txtColor
-        textPaint.textSize = 25f * s
-        canvas.drawText(label, tempRect.centerX(), tempRect.centerY() + 9f * s, textPaint)
+        textPaint.textSize = 24f * s
+        canvas.drawText(label, tempRect.centerX(), tempRect.centerY() + 8f * s, textPaint)
         registerButton(id, x, y, x + w, y + h)
     }
 
@@ -1511,7 +1726,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         fillPaint.color = Color.rgb(26, 22, 34)
         canvas.drawRect(0f, 0f, screenW, screenH, fillPaint)
 
-        // 4 крупные вкладки магазина
         val tabs = ShopTab.values()
         val tabW = (screenW - 36f * s) / tabs.size
         val tabTop = 114f * s
@@ -1941,234 +2155,4 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (ft.active) {
                 val alpha = ((ft.life / ft.maxLife) * 255).toInt().coerceIn(0, 255)
                 textOutlinePaint.color = Color.argb(alpha, 15, 15, 20)
-                textPaint.color = Color.argb(alpha, Color.red(ft.color), Color.green(ft.color), Color.blue(ft.color))
-                canvas.drawText(ft.text, ft.x, ft.y, textOutlinePaint)
-                canvas.drawText(ft.text, ft.x, ft.y, textPaint)
-            }
-        }
-    }
-
-    private fun renderAchievementBanner(canvas: Canvas) {
-        if (bannerTimer <= 0f) return
-        val s = uiScale
-        val slide = min(1f, bannerTimer * 3f) * min(1f, (3.5f - bannerTimer) * 5f + 0.2f)
-        val bannerH = 82f * s
-        val top = -bannerH - 10f + (bannerH + 34f * s) * slide
-        tempRect.set(28f * s, top, screenW - 28f * s, top + bannerH)
-        fillPaint.color = Color.rgb(46, 125, 50)
-        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
-        strokePaint.color = Color.rgb(255, 215, 0)
-        strokePaint.strokeWidth = 3f * s
-        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, strokePaint)
-
-        textPaint.color = Color.WHITE
-        textPaint.textSize = 21f * s
-        canvas.drawText(bannerTitle, screenW * 0.5f, top + 34f * s, textPaint)
-        textPaint.color = Color.rgb(255, 215, 0)
-        textPaint.textSize = 18f * s
-        canvas.drawText(bannerReward, screenW * 0.5f, top + 62f * s, textPaint)
-    }
-
-    // ==================== INSTANT INPUT HANDLING ====================
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x
-        val y = event.y
-
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                lastTouchX = x
-                lastTouchY = y
-                touchMovedDist = 0f
-                isDraggingScroll = false
-
-                // Мгновенный клик на ACTION_DOWN без задержки на отпускание пальца!
-                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
-                if (!isScrollableScreen || y < 180f * uiScale) {
-                    handleTap(x, y)
-                }
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val dx = x - lastTouchX
-                val dy = y - lastTouchY
-                touchMovedDist += abs(dx) + abs(dy)
-                lastTouchX = x
-                lastTouchY = y
-
-                if (state == ScreenState.PLAYING && activeBossFight == null) {
-                    val sensitivity = 2.35f / screenW
-                    crowd.centerX += dx * sensitivity
-                } else if (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS) {
-                    if (touchMovedDist > 24f * uiScale) {
-                        isDraggingScroll = true
-                        scrollOffsetY = (scrollOffsetY - dy).coerceIn(0f, maxScrollY)
-                    }
-                }
-                return true
-            }
-            MotionEvent.ACTION_UP -> {
-                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
-                if (isScrollableScreen && y >= 180f * uiScale && !isDraggingScroll && touchMovedDist < 42f * uiScale) {
-                    handleTap(x, y)
-                }
-                isDraggingScroll = false
-                return true
-            }
-        }
-        return super.onTouchEvent(event)
-    }
-
-    private fun handleTap(x: Float, y: Float): Boolean {
-        val snapshot = readableButtons
-        for (i in snapshot.size - 1 downTo 0) {
-            val btn = snapshot[i]
-            if (btn.rect.contains(x, y)) {
-                sound.playClick()
-                executeButtonAction(btn.id)
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun executeButtonAction(id: String) {
-        when {
-            id == "toggle_mute" -> {
-                sound.muted = !sound.muted
-            }
-            id.startsWith("arm_booster:") -> {
-                val bId = id.substringAfter(":")
-                val b = Config.BoosterType.values().find { it.id == bId } ?: return
-                if (prefs.getBoosterCount(b) > 0) {
-                    prefs.setBoosterArmed(b, !prefs.isBoosterArmed(b))
-                } else {
-                    currentShopTab = ShopTab.BOOSTERS
-                    scrollOffsetY = 0f
-                    state = ScreenState.SHOP
-                }
-            }
-            id == "play_current" -> {
-                startLevel(prefs.level)
-            }
-            id == "open_levels" -> {
-                levelPage = (prefs.level - 1) / 20
-                state = ScreenState.LEVEL_SELECT
-            }
-            id == "open_shop" -> {
-                scrollOffsetY = 0f
-                state = ScreenState.SHOP
-            }
-            id == "open_achievements" -> {
-                scrollOffsetY = 0f
-                state = ScreenState.ACHIEVEMENTS
-            }
-            id == "back_menu" || id == "pause_menu" || id == "win_menu" || id == "lose_menu" -> {
-                scrollOffsetY = 0f
-                state = ScreenState.MENU
-            }
-            id == "pause" -> {
-                state = ScreenState.PAUSED
-            }
-            id == "pause_resume" -> {
-                state = ScreenState.PLAYING
-            }
-            id == "pause_restart" || id == "lose_retry" -> {
-                val cur = levelData?.levelNumber ?: prefs.level
-                startLevel(cur)
-            }
-            id == "win_next" -> {
-                startLevel(prefs.level)
-            }
-            id.startsWith("select_level:") -> {
-                val lvl = id.substringAfter(":").toIntOrNull() ?: 1
-                if (lvl <= prefs.maxUnlockedLevel) {
-                    startLevel(lvl)
-                }
-            }
-            id == "lvl_prev_page" -> {
-                if (levelPage > 0) levelPage--
-            }
-            id == "lvl_next_page" -> {
-                if ((levelPage + 1) * 20 < prefs.maxUnlockedLevel + 20) levelPage++
-            }
-            id.startsWith("shop_tab:") -> {
-                val tabName = id.substringAfter(":")
-                currentShopTab = ShopTab.valueOf(tabName)
-                scrollOffsetY = 0f
-            }
-            id.startsWith("buy_mug:") -> {
-                val skinId = id.substringAfter(":")
-                val skin = Config.getMugSkin(skinId)
-                if (prefs.isMugSkinUnlocked(skin.id)) {
-                    prefs.selectedSkinId = skin.id
-                } else if (skin.unlockAchievementId == null && prefs.coins >= skin.price) {
-                    prefs.coins -= skin.price
-                    prefs.addStat("coins_spent", skin.price)
-                    prefs.unlockMugSkin(skin.id)
-                    prefs.selectedSkinId = skin.id
-                    checkAndShowAchievements()
-                }
-            }
-            id.startsWith("buy_boss:") -> {
-                val bossId = id.substringAfter(":")
-                if (bossId == "auto") {
-                    prefs.selectedBossId = "auto"
-                } else {
-                    val boss = Config.getBossSkin(bossId)
-                    if (prefs.isBossSkinUnlocked(boss.id)) {
-                        prefs.selectedBossId = boss.id
-                    } else if (prefs.coins >= boss.price) {
-                        prefs.coins -= boss.price
-                        prefs.addStat("coins_spent", boss.price)
-                        prefs.unlockBossSkin(boss.id)
-                        prefs.selectedBossId = boss.id
-                        checkAndShowAchievements()
-                    }
-                }
-            }
-            id.startsWith("buy_upgrade:") -> {
-                val upgId = id.substringAfter(":")
-                val upg = Config.UpgradeType.values().find { it.id == upgId } ?: return
-                if (prefs.getUpgradeLevel(upg) < upg.maxLevel) {
-                    val price = prefs.getUpgradePrice(upg)
-                    if (prefs.coins >= price) {
-                        prefs.coins -= price
-                        prefs.addStat("coins_spent", price)
-                        prefs.addStat("upgrades_bought", 1)
-                        prefs.incrementUpgrade(upg)
-                        checkAndShowAchievements()
-                    }
-                }
-            }
-            id.startsWith("buy_booster:") -> {
-                val bId = id.substringAfter(":")
-                val b = Config.BoosterType.values().find { it.id == bId } ?: return
-                if (prefs.coins >= b.price) {
-                    prefs.coins -= b.price
-                    prefs.addStat("coins_spent", b.price)
-                    prefs.addBooster(b, 1)
-                    prefs.setBoosterArmed(b, true)
-                    checkAndShowAchievements()
-                }
-            }
-            id.startsWith("buy_loc:") -> {
-                val locId = id.substringAfter(":")
-                if (locId == "auto") {
-                    prefs.selectedLocationId = "auto"
-                } else {
-                    val loc = Config.getLocationById(locId)
-                    if (prefs.isLocationUnlocked(loc.id)) {
-                        prefs.selectedLocationId = loc.id
-                    } else if (prefs.coins >= loc.price) {
-                        prefs.coins -= loc.price
-                        prefs.addStat("coins_spent", loc.price)
-                        prefs.unlockLocation(loc.id)
-                        prefs.selectedLocationId = loc.id
-                        checkAndShowAchievements()
-                    }
-                }
-            }
-        }
-    }
-}
+                textPaint.color = Color.argb(
