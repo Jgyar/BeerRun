@@ -43,10 +43,10 @@ object LevelGenerator {
         val isMegaBoss = (safeLevel % 5 == 0)
         val isFastBoss = (!isMegaBoss && (safeLevel % 3 == 0) && safeLevel > 1)
 
-        // Длина трассы растёт с уровнем в разумных пределах
-        val trackLength = (2300f + min(safeLevel, 25) * 95f).coerceIn(2300f, 4700f)
+        // Увеличенная длина трассы, чтобы между рамками и препятствиями было много времени на реакцию
+        val trackLength = (3500f + min(safeLevel, 25) * 125f).coerceIn(3500f, 6600f)
 
-        // Минимум 6 пар/рядов рамок на каждом уровне, число растёт с уровнем
+        // Минимум 6 рядов рамок на каждом уровне, число растёт с уровнем
         val gateRowCount = (6 + min((safeLevel - 1) / 2, 8)).coerceIn(6, 14)
 
         val gateRows = ArrayList<GateRow>(gateRowCount)
@@ -54,8 +54,9 @@ object LevelGenerator {
         val pickups = ArrayList<PickupItem>()
         val enemies = ArrayList<EnemyGroup>()
 
-        val startZ = 340f
-        val endZ = trackLength - 380f
+        // Даём игроку ~2.2 секунды спокойного старта до первых рамок
+        val startZ = 560f
+        val endZ = trackLength - 460f
         val stepZ = (endZ - startZ) / gateRowCount.toFloat()
 
         // Мини-босс посередине трассы начиная с 3-го уровня
@@ -81,18 +82,17 @@ object LevelGenerator {
             val row = createGateRow(safeLevel, i, z, rng)
             gateRows.add(row)
 
-            // Добавляем препятствия, врагов и бонусы между рядами рамок
+            // Добавляем препятствия, врагов и бонусы ровно посередине между рядами рамок
             val midZ = z + stepZ * 0.50f
-            if (midZ < endZ - 120f) {
+            if (midZ < endZ - 160f) {
                 populateSegment(safeLevel, i, midZ, rng, obstacles, pickups, enemies)
             }
         }
 
-        // Гарантируем, что рамки всегда есть
         if (gateRows.isEmpty()) {
             gateRows.add(
                 GateRow(
-                    z = 500f,
+                    z = 600f,
                     gates = mutableListOf(
                         GateItem(-0.5f, 0.46f, Config.GateOp.ADD, 10),
                         GateItem(0.5f, 0.46f, Config.GateOp.MUL, 2)
@@ -104,17 +104,16 @@ object LevelGenerator {
         // Проверка проходимости по оптимальному пути от базового старта
         var optimalMax = computeOptimalPath(gateRows, miniBoss)
         if (optimalMax < 16) {
-            // Страховка: усиливаем первую рамку и пересчитываем
             gateRows[0].gates[0].op = Config.GateOp.ADD
             gateRows[0].gates[0].value = 18
             optimalMax = computeOptimalPath(gateRows, miniBoss)
         }
 
-        // Подгоняем жажду босса под 65%-78% от оптимального пути (не тривиально, но 100% проходимо)
+        // Подгоняем жажду босса под 62%-76% от оптимального пути (проходимо при хорошей игре)
         val ratio = when {
-            isMegaBoss -> 0.78f
-            isFastBoss -> 0.62f
-            else -> 0.68f
+            isMegaBoss -> 0.76f
+            isFastBoss -> 0.60f
+            else -> 0.66f
         }
         val rawThirst = (optimalMax * ratio).toInt()
         val bossThirst = rawThirst
@@ -153,7 +152,6 @@ object LevelGenerator {
         z: Float,
         rng: Random
     ): GateRow {
-        // Первый уровень: понятные и приятные рамки для знакомства
         if (level == 1) {
             val gates = when (rowIndex) {
                 0 -> mutableListOf(
@@ -184,7 +182,6 @@ object LevelGenerator {
             return GateRow(z = z, gates = gates)
         }
 
-        // Начиная со 2 уровня: двойные или тройные рамки + движущиеся рамки
         val useTriple = (level >= 3 && rowIndex % 3 == 2 && rng.nextFloat() < 0.55f)
         val isMoving = (level >= 2 && rowIndex > 0 && rng.nextFloat() < 0.35f)
 
@@ -221,7 +218,7 @@ object LevelGenerator {
             gates = gates,
             isMoving = isMoving,
             movePhase = rng.nextFloat() * 6.28f,
-            moveSpeed = 1.4f + rng.nextFloat() * 0.8f
+            moveSpeed = 1.25f + rng.nextFloat() * 0.65f
         )
     }
 
@@ -232,7 +229,6 @@ object LevelGenerator {
         rowIndex: Int,
         rng: Random
     ): GateItem {
-        // В начале уровня чаще + чтобы умножение потом давало эффект
         return if (rowIndex == 0 || rng.nextFloat() < 0.62f) {
             val addVal = (5 + rng.nextInt(6 + min(level, 15) * 2))
             GateItem(laneX, halfW, Config.GateOp.ADD, addVal)
@@ -251,7 +247,6 @@ object LevelGenerator {
         val roll = rng.nextFloat()
         return when {
             roll < 0.30f -> {
-                // Слабее, но положительная рамка
                 GateItem(laneX, halfW, Config.GateOp.ADD, 2 + rng.nextInt(5))
             }
             roll < 0.72f -> {
@@ -277,7 +272,6 @@ object LevelGenerator {
         val choice = rng.nextInt(6)
         when (choice) {
             0 -> {
-                // Вращающаяся пила
                 val x = (rng.nextFloat() * 1.2f) - 0.6f
                 val moving = level >= 2 && rng.nextBoolean()
                 obstacles.add(
@@ -286,19 +280,18 @@ object LevelGenerator {
                         x = x,
                         halfWidth = 0.22f,
                         type = ObstacleType.SAW,
-                        moveSpeed = if (moving) 1.8f else 0f,
+                        moveSpeed = if (moving) 1.5f else 0f,
                         movePhase = rng.nextFloat() * 6.28f
                     )
                 )
             }
             1 -> {
-                // Липкая лужа + бонусная кружка сбоку
                 val puddleX = if (rng.nextBoolean()) -0.35f else 0.35f
                 obstacles.add(
                     ObstacleItem(
                         z = z,
                         x = puddleX,
-                        halfWidth = 0.26f,
+                        halfWidth = 0.25f,
                         type = ObstacleType.PUDDLE
                     )
                 )
@@ -312,19 +305,17 @@ object LevelGenerator {
                 )
             }
             2 -> {
-                // Ящики-барьеры, которые нужно обойти
-                val lane = rng.nextInt(3) - 1 // -1, 0, 1
+                val lane = rng.nextInt(3) - 1
                 obstacles.add(
                     ObstacleItem(
                         z = z,
                         x = lane * 0.55f,
-                        halfWidth = 0.25f,
+                        halfWidth = 0.24f,
                         type = ObstacleType.CRATE
                     )
                 )
             }
             3 -> {
-                // Человечки-противники в красном!
                 val enemyCount = (3 + min(level * 2, 24) + rowIndex).coerceAtMost(35)
                 val x = (rng.nextFloat() * 0.9f) - 0.45f
                 enemies.add(
@@ -338,20 +329,19 @@ object LevelGenerator {
                 )
             }
             4 -> {
-                // Узкий мост (нужно держаться ближе к центру) + сундук с монетами
                 if (level >= 2) {
                     obstacles.add(
                         ObstacleItem(
                             z = z,
                             x = 0f,
-                            halfWidth = 0.46f, // безопасная ширина моста
+                            halfWidth = 0.48f,
                             type = ObstacleType.NARROW_BRIDGE,
-                            lengthZ = 150f
+                            lengthZ = 170f
                         )
                     )
                     pickups.add(
                         PickupItem(
-                            z = z + 40f,
+                            z = z + 55f,
                             x = 0f,
                             type = PickupType.COIN_CHEST,
                             value = 15 + level * 3
@@ -360,7 +350,6 @@ object LevelGenerator {
                 }
             }
             else -> {
-                // Бонусные кружки по краям дорожки + сундук
                 val side = if (rng.nextBoolean()) -0.76f else 0.76f
                 pickups.add(
                     PickupItem(
@@ -373,7 +362,7 @@ object LevelGenerator {
                 if (rng.nextFloat() < 0.45f) {
                     pickups.add(
                         PickupItem(
-                            z = z + 35f,
+                            z = z + 50f,
                             x = -side * 0.85f,
                             type = PickupType.COIN_CHEST,
                             value = 15 + level * 2
