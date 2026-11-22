@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.content.Context
@@ -197,4 +196,3 @@ class Sound(context: Context) {
         private const val SAMPLE_RATE = 22050
     }
 }
-```
