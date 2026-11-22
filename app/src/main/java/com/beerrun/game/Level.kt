@@ -54,8 +54,8 @@ object LevelGenerator {
         val pickups = ArrayList<PickupItem>()
         val enemies = ArrayList<EnemyGroup>()
 
-        // Даём игроку ~2.2 секунды спокойного старта до первых рамок
-        val startZ = 560f
+        // Даём игроку ~2 секунды спокойного старта до первых рамок с учётом позиции толпы
+        val startZ = 680f
         val endZ = trackLength - 460f
         val stepZ = (endZ - startZ) / gateRowCount.toFloat()
 
