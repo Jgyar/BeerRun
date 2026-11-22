@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.graphics.Color
@@ -70,4 +69,3 @@ object Config {
         }
     }
 }
-```
