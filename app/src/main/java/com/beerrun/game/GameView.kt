@@ -2155,4 +2155,395 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (ft.active) {
                 val alpha = ((ft.life / ft.maxLife) * 255).toInt().coerceIn(0, 255)
                 textOutlinePaint.color = Color.argb(alpha, 15, 15, 20)
-                textPaint.color = Color.argb(
+                textPaint.color = Color.argb(alpha, Color.red(ft.color), Color.green(ft.color), Color.blue(ft.color))
+                canvas.drawText(ft.text, ft.x, ft.y, textOutlinePaint)
+                canvas.drawText(ft.text, ft.x, ft.y, textPaint)
+            }
+        }
+    }
+
+    private fun renderAchievementBanner(canvas: Canvas) {
+        if (bannerTimer <= 0f) return
+        val s = uiScale
+        val slide = min(1f, bannerTimer * 3f) * min(1f, (3.5f - bannerTimer) * 5f + 0.2f)
+        val bannerH = 82f * s
+        val top = -bannerH - 10f + (bannerH + 34f * s) * slide
+        tempRect.set(28f * s, top, screenW - 28f * s, top + bannerH)
+        fillPaint.color = Color.rgb(46, 125, 50)
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, fillPaint)
+        strokePaint.color = Color.rgb(255, 215, 0)
+        strokePaint.strokeWidth = 3f * s
+        canvas.drawRoundRect(tempRect, 20f * s, 20f * s, strokePaint)
+
+        textPaint.color = Color.WHITE
+        textPaint.textSize = 21f * s
+        canvas.drawText(bannerTitle, screenW * 0.5f, top + 34f * s, textPaint)
+        textPaint.color = Color.rgb(255, 215, 0)
+        textPaint.textSize = 18f * s
+        canvas.drawText(bannerReward, screenW * 0.5f, top + 62f * s, textPaint)
+    }
+
+    // ==================== DIALOGS & CLIPBOARD ====================
+
+    private fun showGitHubTokenDialog() {
+        post {
+            val container = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(48, 28, 48, 12)
+            }
+            val hintView = TextView(context).apply {
+                text = "Вставь GitHub Personal Access Token с правом 'gist'.\nИгра сама создаст закрытый Gist на твоём аккаунте."
+                textSize = 14f
+                setPadding(0, 0, 0, 20)
+            }
+            val input = EditText(context).apply {
+                hint = "ghp_... или github_pat_..."
+                setText(prefs.githubToken)
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                setSingleLine(true)
+            }
+            container.addView(hintView)
+            container.addView(input)
+
+            AlertDialog.Builder(context)
+                .setTitle("Привязка GitHub Gist")
+                .setView(container)
+                .setPositiveButton("Сохранить токен") { _, _ ->
+                    val token = input.text.toString().trim()
+                    if (token.isNotEmpty()) {
+                        prefs.githubToken = token
+                        prefs.githubGistId = ""
+                        accountStatusColor = Color.rgb(129, 212, 250)
+                        accountStatusText = "Токен сохранён! Нажми «Сохранить» или «Загрузить»"
+                    }
+                }
+                .setNeutralButton("Создать токен") { _, _ ->
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/settings/tokens/new?description=BeerRunSave&scopes=gist"))
+                        context.startActivity(intent)
+                    } catch (_: Exception) {
+                        accountStatusColor = Color.rgb(255, 202, 40)
+                        accountStatusText = "Открой github.com/settings/tokens и выбери право gist"
+                    }
+                }
+                .setNegativeButton("Отмена", null)
+                .show()
+        }
+    }
+
+    private fun copyTransferCodeToClipboard() {
+        post {
+            try {
+                val code = prefs.exportTransferCode()
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("BeerRunSave", code))
+                accountStatusColor = Color.rgb(105, 240, 174)
+                accountStatusText = "Код скопирован в буфер! Сохрани его в заметки"
+            } catch (e: Exception) {
+                accountStatusColor = Color.rgb(255, 82, 82)
+                accountStatusText = "Ошибка копирования кода"
+            }
+        }
+    }
+
+    private fun showPasteCodeDialog() {
+        post {
+            val container = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(48, 28, 48, 12)
+            }
+            val hintView = TextView(context).apply {
+                text = "Вставь код сохранения (начинается с BEER1:):"
+                textSize = 14f
+                setPadding(0, 0, 0, 16)
+            }
+            val input = EditText(context).apply {
+                hint = "BEER1:..."
+                minLines = 3
+                maxLines = 6
+            }
+
+            // Если в буфере обмена уже есть код сохранения, подставляем его автоматически
+            try {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clipText = clipboard.primaryClip?.getItemAt(0)?.text?.toString()?.trim() ?: ""
+                if (clipText.startsWith("BEER1:") || clipText.startsWith("{")) {
+                    input.setText(clipText)
+                }
+            } catch (_: Exception) {
+            }
+
+            container.addView(hintView)
+            container.addView(input)
+
+            AlertDialog.Builder(context)
+                .setTitle("Восстановление по коду")
+                .setView(container)
+                .setPositiveButton("Восстановить") { _, _ ->
+                    val res = prefs.importTransferCode(input.text.toString())
+                    if (res.isSuccess) {
+                        levelPage = (prefs.level - 1) / 20
+                        sound.playWin()
+                        accountStatusColor = Color.rgb(105, 240, 174)
+                        accountStatusText = "Восстановлено: ${res.getOrNull()}"
+                    } else {
+                        sound.playGateBad()
+                        accountStatusColor = Color.rgb(255, 82, 82)
+                        accountStatusText = res.exceptionOrNull()?.message ?: "Неверный код"
+                    }
+                }
+                .setNegativeButton("Отмена", null)
+                .show()
+        }
+    }
+
+    // ==================== INSTANT INPUT HANDLING ====================
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val x = event.x
+        val y = event.y
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastTouchX = x
+                lastTouchY = y
+                touchMovedDist = 0f
+                isDraggingScroll = false
+
+                // Мгновенный клик на ACTION_DOWN без задержки на отпускание пальца!
+                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
+                if (!isScrollableScreen || y < 180f * uiScale) {
+                    handleTap(x, y)
+                }
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = x - lastTouchX
+                val dy = y - lastTouchY
+                touchMovedDist += abs(dx) + abs(dy)
+                lastTouchX = x
+                lastTouchY = y
+
+                if (state == ScreenState.PLAYING && activeBossFight == null) {
+                    val sensitivity = 2.35f / screenW
+                    crowd.centerX += dx * sensitivity
+                } else if (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS) {
+                    if (touchMovedDist > 24f * uiScale) {
+                        isDraggingScroll = true
+                        scrollOffsetY = (scrollOffsetY - dy).coerceIn(0f, maxScrollY)
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                val isScrollableScreen = (state == ScreenState.SHOP || state == ScreenState.ACHIEVEMENTS)
+                if (isScrollableScreen && y >= 180f * uiScale && !isDraggingScroll && touchMovedDist < 42f * uiScale) {
+                    handleTap(x, y)
+                }
+                isDraggingScroll = false
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    private fun handleTap(x: Float, y: Float): Boolean {
+        val snapshot = readableButtons
+        for (i in snapshot.size - 1 downTo 0) {
+            val btn = snapshot[i]
+            if (btn.rect.contains(x, y)) {
+                sound.playClick()
+                executeButtonAction(btn.id)
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun executeButtonAction(id: String) {
+        when {
+            id == "toggle_mute" -> {
+                sound.muted = !sound.muted
+            }
+            id.startsWith("arm_booster:") -> {
+                val bId = id.substringAfter(":")
+                val b = Config.BoosterType.values().find { it.id == bId } ?: return
+                if (prefs.getBoosterCount(b) > 0) {
+                    prefs.setBoosterArmed(b, !prefs.isBoosterArmed(b))
+                } else {
+                    currentShopTab = ShopTab.BOOSTERS
+                    scrollOffsetY = 0f
+                    state = ScreenState.SHOP
+                }
+            }
+            id == "play_current" -> {
+                startLevel(prefs.level)
+            }
+            id == "open_levels" -> {
+                levelPage = (prefs.level - 1) / 20
+                state = ScreenState.LEVEL_SELECT
+            }
+            id == "open_shop" -> {
+                scrollOffsetY = 0f
+                state = ScreenState.SHOP
+            }
+            id == "open_achievements" -> {
+                scrollOffsetY = 0f
+                state = ScreenState.ACHIEVEMENTS
+            }
+            id == "open_account" -> {
+                accountStatusText = ""
+                state = ScreenState.ACCOUNT
+            }
+            id == "gh_set_token" -> {
+                showGitHubTokenDialog()
+            }
+            id == "gh_save" -> {
+                if (isCloudBusy) return
+                isCloudBusy = true
+                accountStatusColor = Color.rgb(129, 212, 250)
+                accountStatusText = "Отправка сохранения на GitHub..."
+                prefs.saveToGitHubGist { ok, msg ->
+                    isCloudBusy = false
+                    accountStatusColor = if (ok) Color.rgb(105, 240, 174) else Color.rgb(255, 82, 82)
+                    accountStatusText = msg
+                    if (ok) sound.playPickup() else sound.playGateBad()
+                }
+            }
+            id == "gh_load" -> {
+                if (isCloudBusy) return
+                isCloudBusy = true
+                accountStatusColor = Color.rgb(129, 212, 250)
+                accountStatusText = "Поиск сохранения на GitHub..."
+                prefs.loadFromGitHubGist { ok, msg ->
+                    isCloudBusy = false
+                    accountStatusColor = if (ok) Color.rgb(105, 240, 174) else Color.rgb(255, 82, 82)
+                    accountStatusText = msg
+                    if (ok) {
+                        levelPage = (prefs.level - 1) / 20
+                        sound.playWin()
+                    } else {
+                        sound.playGateBad()
+                    }
+                }
+            }
+            id == "gh_unlink" -> {
+                prefs.clearGitHubLink()
+                accountStatusColor = Color.rgb(255, 202, 40)
+                accountStatusText = "GitHub отвязан от этого устройства"
+            }
+            id == "code_copy" -> {
+                copyTransferCodeToClipboard()
+            }
+            id == "code_paste" -> {
+                showPasteCodeDialog()
+            }
+            id == "back_menu" || id == "pause_menu" || id == "win_menu" || id == "lose_menu" -> {
+                scrollOffsetY = 0f
+                state = ScreenState.MENU
+            }
+            id == "pause" -> {
+                state = ScreenState.PAUSED
+            }
+            id == "pause_resume" -> {
+                state = ScreenState.PLAYING
+            }
+            id == "pause_restart" || id == "lose_retry" -> {
+                val cur = levelData?.levelNumber ?: prefs.level
+                startLevel(cur)
+            }
+            id == "win_next" -> {
+                startLevel(prefs.level)
+            }
+            id.startsWith("select_level:") -> {
+                val lvl = id.substringAfter(":").toIntOrNull() ?: 1
+                if (lvl <= prefs.maxUnlockedLevel) {
+                    startLevel(lvl)
+                }
+            }
+            id == "lvl_prev_page" -> {
+                if (levelPage > 0) levelPage--
+            }
+            id == "lvl_next_page" -> {
+                if ((levelPage + 1) * 20 < prefs.maxUnlockedLevel + 20) levelPage++
+            }
+            id.startsWith("shop_tab:") -> {
+                val tabName = id.substringAfter(":")
+                currentShopTab = ShopTab.valueOf(tabName)
+                scrollOffsetY = 0f
+            }
+            id.startsWith("buy_mug:") -> {
+                val skinId = id.substringAfter(":")
+                val skin = Config.getMugSkin(skinId)
+                if (prefs.isMugSkinUnlocked(skin.id)) {
+                    prefs.selectedSkinId = skin.id
+                } else if (skin.unlockAchievementId == null && prefs.coins >= skin.price) {
+                    prefs.coins -= skin.price
+                    prefs.addStat("coins_spent", skin.price)
+                    prefs.unlockMugSkin(skin.id)
+                    prefs.selectedSkinId = skin.id
+                    checkAndShowAchievements()
+                }
+            }
+            id.startsWith("buy_boss:") -> {
+                val bossId = id.substringAfter(":")
+                if (bossId == "auto") {
+                    prefs.selectedBossId = "auto"
+                } else {
+                    val boss = Config.getBossSkin(bossId)
+                    if (prefs.isBossSkinUnlocked(boss.id)) {
+                        prefs.selectedBossId = boss.id
+                    } else if (prefs.coins >= boss.price) {
+                        prefs.coins -= boss.price
+                        prefs.addStat("coins_spent", boss.price)
+                        prefs.unlockBossSkin(boss.id)
+                        prefs.selectedBossId = boss.id
+                        checkAndShowAchievements()
+                    }
+                }
+            }
+            id.startsWith("buy_upgrade:") -> {
+                val upgId = id.substringAfter(":")
+                val upg = Config.UpgradeType.values().find { it.id == upgId } ?: return
+                if (prefs.getUpgradeLevel(upg) < upg.maxLevel) {
+                    val price = prefs.getUpgradePrice(upg)
+                    if (prefs.coins >= price) {
+                        prefs.coins -= price
+                        prefs.addStat("coins_spent", price)
+                        prefs.addStat("upgrades_bought", 1)
+                        prefs.incrementUpgrade(upg)
+                        checkAndShowAchievements()
+                    }
+                }
+            }
+            id.startsWith("buy_booster:") -> {
+                val bId = id.substringAfter(":")
+                val b = Config.BoosterType.values().find { it.id == bId } ?: return
+                if (prefs.coins >= b.price) {
+                    prefs.coins -= b.price
+                    prefs.addStat("coins_spent", b.price)
+                    prefs.addBooster(b, 1)
+                    prefs.setBoosterArmed(b, true)
+                    checkAndShowAchievements()
+                }
+            }
+            id.startsWith("buy_loc:") -> {
+                val locId = id.substringAfter(":")
+                if (locId == "auto") {
+                    prefs.selectedLocationId = "auto"
+                } else {
+                    val loc = Config.getLocationById(locId)
+                    if (prefs.isLocationUnlocked(loc.id)) {
+                        prefs.selectedLocationId = loc.id
+                    } else if (prefs.coins >= loc.price) {
+                        prefs.coins -= loc.price
+                        prefs.addStat("coins_spent", loc.price)
+                        prefs.unlockLocation(loc.id)
+                        prefs.selectedLocationId = loc.id
+                        checkAndShowAchievements()
+                    }
+                }
+            }
+        }
+    }
+}
