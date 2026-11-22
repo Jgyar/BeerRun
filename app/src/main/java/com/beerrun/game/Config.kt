@@ -6,12 +6,13 @@ object Config {
     const val START_COUNT = 1
     const val MAX_MUGS_CAP = 5000
 
-    const val BASE_RUN_SPEED = 430f
+    // Комфортная скорость бега, чтобы успевать читать рамки и реагировать
+    const val BASE_RUN_SPEED = 265f
     const val TRACK_HALF_WIDTH = 1.0f
-    const val NORMAL_BOSS_GULP_INTERVAL = 0.052f
-    const val FAST_BOSS_GULP_INTERVAL = 0.028f
+    const val NORMAL_BOSS_GULP_INTERVAL = 0.062f
+    const val FAST_BOSS_GULP_INTERVAL = 0.034f
 
-    const val HAPPY_HOUR_DURATION = 10f
+    const val HAPPY_HOUR_DURATION = 12f
     const val START_PACK_BONUS = 20
     const val MAX_UPGRADE_LEVEL = 10
 
@@ -64,7 +65,7 @@ object Config {
         HAPPY_HOUR(
             "happy_hour",
             "Счастливый час",
-            "Бонус ко всем + и x рамкам на 10 сек",
+            "Бонус ко всем + и x рамкам на 12 сек",
             200,
             Color.rgb(171, 71, 188)
         )
