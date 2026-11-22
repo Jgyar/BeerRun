@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.graphics.Canvas
@@ -261,4 +260,3 @@ class Boss {
         canvas.drawText(label, cx, ty, textFill)
     }
 }
-```
