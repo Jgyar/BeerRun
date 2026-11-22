@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.graphics.Canvas
@@ -215,4 +214,3 @@ class WorldPaints {
         color = Color.parseColor("#ECEFF1")
     }
 }
-```
