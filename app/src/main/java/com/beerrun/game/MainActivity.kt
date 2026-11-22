@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.app.Activity
@@ -64,4 +63,3 @@ class MainActivity : Activity() {
         }
     }
 }
-```
