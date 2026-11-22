@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.content.Context
@@ -32,4 +31,3 @@ class Prefs(context: Context) {
         prefs.edit().putBoolean("skin_unlocked_${skin.id}", true).apply()
     }
 }
-```
