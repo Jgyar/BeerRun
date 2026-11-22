@@ -135,7 +135,7 @@ class Crowd {
         centerX = centerX.coerceIn(-maxCenter, maxCenter)
 
         val visible = visibleCount()
-        val lerp = (dt * 14f).coerceIn(0.05f, 1f)
+        val lerp = (dt * 24f).coerceIn(0.08f, 1f)
         for (i in 0 until visible) {
             val s = slots[i]
             val targetX = (centerX + s.offsetX).coerceIn(-0.96f, 0.96f)
