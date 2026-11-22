@@ -3,359 +3,357 @@ package com.beerrun.game
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Typeface
-import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-/**
- * Управляет толпой пивных кружек, их формацией, анимацией бега, скинами и счётчиком сверху.
- * Использует примитивные массивы без аллокаций в onDraw для стабильных 60 FPS.
- */
 class Crowd {
-    var count: Int = Config.START_MUGS
+    companion object {
+        const val MAX_VISUAL_MUGS = 160
+        private const val GOLDEN_ANGLE = 2.3999632f
+    }
+
+    class MugSlot {
+        var offsetX = 0f
+        var offsetZ = 0f
+        var currentX = 0f
+        var currentZ = 0f
+        var bobPhase = 0f
+    }
+
+    var count: Int = Config.START_COUNT
         private set
 
     var centerX: Float = 0f
-    var targetX: Float = 0f
-    var activeSkin: Config.Skin = Config.Skin.GLASS_MUG
+    var crowdRadius: Float = 0.08f
+        private set
 
-    // Анимация подпрыгивания облачка со счётчиком
-    private var badgePopScale: Float = 1f
-    private var globalTime: Float = 0f
+    var hasShield: Boolean = false
+    var hasMagnet: Boolean = false
 
-    // Предвыделенные массивы для визуальных кружек (до MAX_VISUAL_MUGS)
-    private val maxVisual = Config.MAX_VISUAL_MUGS
-    private val mugX = FloatArray(maxVisual)
-    private val mugZ = FloatArray(maxVisual)
-    private val slotOffsetX = FloatArray(maxVisual)
-    private val slotOffsetZ = FloatArray(maxVisual)
-    private val mugScale = FloatArray(maxVisual)
-    private val mugPhase = FloatArray(maxVisual)
-    private val drawOrder = IntArray(maxVisual)
-    private var visualCount = 0
+    private val slots = Array(MAX_VISUAL_MUGS) { MugSlot() }
 
-    // Предвыделенные кисти и прямоугольники
+    // Pre-allocated drawing tools (zero allocation in onDraw)
     private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val darkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val foamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val accentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        color = Color.parseColor("#3E2723")
-    }
-    private val foamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Config.COLOR_FOAM
-    }
-    private val foamShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Config.COLOR_FOAM_SHADOW
-    }
-    private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.argb(115, 255, 255, 255)
-    }
-    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.argb(65, 0, 0, 0)
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
     }
     private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.WHITE
+        color = Color.argb(225, 255, 255, 255)
     }
     private val badgeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        color = Color.parseColor("#FF8F00")
-        strokeWidth = 6f
+        strokeWidth = 3f
+        color = Color.rgb(255, 160, 0)
     }
-    private val countTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#212121")
+    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(45, 25, 10)
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        isFakeBoldText = true
     }
-    private val countStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.STROKE
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-    }
-
-    private val tmpRect = RectF()
-    private val badgeRect = RectF()
+    private val tempRect = RectF()
+    private val tempPath = Path()
+    private val hsvArray = FloatArray(3)
 
     init {
-        computeSpiralSlots()
-        reset(Config.START_MUGS)
+        computeSpiralOffsets()
+        reset(Config.START_COUNT)
     }
 
-    /**
-     * Спираль Фибоначчи для плотного и естественного расположения толпы.
-     */
-    private fun computeSpiralSlots() {
-        val goldenAngle = (PI * (3.0 - sqrt(5.0))).toFloat()
-        slotOffsetX[0] = 0f
-        slotOffsetZ[0] = 0f
-        for (i in 1 until maxVisual) {
-            val r = 0.052f * sqrt(i.toFloat())
-            val theta = i * goldenAngle
-            slotOffsetX[i] = r * cos(theta)
-            slotOffsetZ[i] = r * sin(theta) * 14f
+    private fun computeSpiralOffsets() {
+        for (i in 0 until MAX_VISUAL_MUGS) {
+            if (i == 0) {
+                slots[i].offsetX = 0f
+                slots[i].offsetZ = 0f
+            } else {
+                val r = 0.055f * sqrt(i.toFloat())
+                val theta = i * GOLDEN_ANGLE
+                slots[i].offsetX = r * cos(theta)
+                slots[i].offsetZ = r * sin(theta) * 0.75f
+            }
+            slots[i].bobPhase = i * 0.45f
         }
     }
 
-    fun reset(initialCount: Int = Config.START_MUGS) {
+    fun reset(startCount: Int) {
         centerX = 0f
-        targetX = 0f
-        count = initialCount.coerceAtLeast(0)
-        visualCount = min(count, maxVisual)
-        badgePopScale = 1f
-        for (i in 0 until maxVisual) {
-            mugX[i] = slotOffsetX[i]
-            mugZ[i] = slotOffsetZ[i]
-            mugScale[i] = if (i < visualCount) 1f else 0f
-            mugPhase[i] = (i * 0.73f) % (2f * PI.toFloat())
-            drawOrder[i] = i
+        hasShield = false
+        hasMagnet = false
+        count = startCount.coerceIn(1, Config.MAX_MUGS_CAP)
+        updateRadius()
+        for (i in 0 until MAX_VISUAL_MUGS) {
+            slots[i].currentX = centerX + slots[i].offsetX
+            slots[i].currentZ = slots[i].offsetZ
         }
     }
 
     fun setCount(newCount: Int) {
-        val clamped = newCount.coerceAtLeast(0)
-        if (clamped == count) return
-        val oldVisual = visualCount
-        count = clamped
-        visualCount = min(count, maxVisual)
-        badgePopScale = 1.35f
+        count = newCount.coerceIn(0, Config.MAX_MUGS_CAP)
+        updateRadius()
+    }
 
-        if (visualCount > oldVisual) {
-            for (i in oldVisual until visualCount) {
-                mugX[i] = centerX + slotOffsetX[i] * 0.4f
-                mugZ[i] = slotOffsetZ[i] * 0.4f
-                mugScale[i] = 0.15f
-                mugPhase[i] = (i * 0.91f) % (2f * PI.toFloat())
-            }
+    fun addCount(delta: Int) {
+        setCount(count + delta)
+    }
+
+    fun applyGate(op: Config.GateOp, value: Int) {
+        val next = when (op) {
+            Config.GateOp.ADD -> count + value
+            Config.GateOp.SUB -> count - value
+            Config.GateOp.MUL -> count * value
+            Config.GateOp.DIV -> if (value > 0) count / value else count
+        }
+        setCount(next)
+    }
+
+    private fun updateRadius() {
+        val visible = visibleCount()
+        crowdRadius = if (visible <= 1) {
+            0.07f
+        } else {
+            (0.06f * sqrt(visible.toFloat())).coerceIn(0.08f, 0.62f)
         }
     }
 
-    fun update(dt: Float, isRunning: Boolean) {
-        globalTime += dt
-        badgePopScale += (1f - badgePopScale) * min(1f, dt * 12f)
-
-        // Ограничиваем смещение центра так, чтобы толпа не выходила за края дороги
-        val crowdRadius = if (visualCount > 1) 0.052f * sqrt(visualCount.toFloat()) else 0.05f
-        val maxBound = (Config.ROAD_HALF_BOUND - crowdRadius * 0.55f).coerceAtLeast(0.25f)
-        targetX = targetX.coerceIn(-maxBound, maxBound)
-        centerX += (targetX - centerX) * min(1f, dt * 16f)
-
-        val followSpeed = min(1f, dt * 11f)
-        val scaleSpeed = min(1f, dt * 14f)
-
-        for (i in 0 until visualCount) {
-            val tx = (centerX + slotOffsetX[i]).coerceIn(-0.94f, 0.94f)
-            val tz = slotOffsetZ[i]
-            mugX[i] += (tx - mugX[i]) * followSpeed
-            mugZ[i] += (tz - mugZ[i]) * followSpeed
-            mugScale[i] += (1f - mugScale[i]) * scaleSpeed
-            if (isRunning) {
-                mugPhase[i] += dt * 13f
-            }
-            drawOrder[i] = i
-        }
-
-        // Сортировка вставками от дальних Z к ближним для корректного перекрытия
-        for (i in 1 until visualCount) {
-            val key = drawOrder[i]
-            val keyZ = mugZ[key]
-            var j = i - 1
-            while (j >= 0 && mugZ[drawOrder[j]] < keyZ) {
-                drawOrder[j + 1] = drawOrder[j]
-                j--
-            }
-            drawOrder[j + 1] = key
-        }
+    fun visibleCount(): Int {
+        if (count <= 0) return 0
+        if (count <= 60) return count
+        val extra = ((count - 60) / 30).coerceAtMost(MAX_VISUAL_MUGS - 60)
+        return (60 + extra).coerceAtMost(MAX_VISUAL_MUGS)
     }
 
-    /**
-     * Возвращает X-координату визуальной кружки по индексу (для проверки столкновения с ловушками).
-     */
-    fun getVisualMugX(index: Int): Float = mugX[index]
-    fun getVisualMugZ(index: Int): Float = mugZ[index]
-    fun getVisualCount(): Int = visualCount
+    fun update(dt: Float, timeSec: Float) {
+        val maxCenter = (Config.TRACK_HALF_WIDTH - crowdRadius * 0.65f).coerceAtLeast(0.15f)
+        centerX = centerX.coerceIn(-maxCenter, maxCenter)
+
+        val visible = visibleCount()
+        val lerp = (dt * 14f).coerceIn(0.05f, 1f)
+        for (i in 0 until visible) {
+            val s = slots[i]
+            val targetX = (centerX + s.offsetX).coerceIn(-0.96f, 0.96f)
+            val targetZ = s.offsetZ
+            s.currentX += (targetX - s.currentX) * lerp
+            s.currentZ += (targetZ - s.currentZ) * lerp
+        }
+    }
 
     fun draw(
         canvas: Canvas,
-        centerScreenX: Float,
-        horizonY: Float,
-        playerY: Float,
-        roadHalfWidth: Float
+        screenCenterX: Float,
+        baseScreenY: Float,
+        trackHalfPx: Float,
+        skin: Config.MugSkinDef,
+        timeSec: Float
     ) {
-        if (count <= 0 || visualCount <= 0) return
+        val visible = visibleCount()
+        if (visible <= 0) return
 
-        var minScreenY = Float.MAX_VALUE
-        var sumScreenX = 0f
-
-        for (k in 0 until visualCount) {
-            val idx = drawOrder[k]
-            val z = mugZ[idx]
-            val p = Config.FOCAL_LENGTH / (Config.FOCAL_LENGTH + z)
-            val sx = centerScreenX + mugX[idx] * roadHalfWidth * p
-            val baseSy = horizonY + (playerY - horizonY) * p
-            val hop = kotlin.math.abs(sin(mugPhase[idx])) * 11f * p
-            val sy = baseSy - hop
-            val unitSize = roadHalfWidth * 0.135f * p * mugScale[idx]
-
-            sumScreenX += sx
-            val topY = sy - unitSize * 2.2f
-            if (topY < minScreenY) minScreenY = topY
-
-            drawSingleUnit(canvas, sx, sy, baseSy, unitSize, activeSkin)
+        // Magnet rings under crowd
+        if (hasMagnet) {
+            val pulse = ((timeSec * 2.2f) % 1f)
+            strokePaint.color = Color.argb(((1f - pulse) * 160).toInt(), 255, 82, 82)
+            strokePaint.strokeWidth = 4f
+            val r = (crowdRadius * trackHalfPx + 24f) * (0.7f + 0.5f * pulse)
+            tempRect.set(
+                screenCenterX + centerX * trackHalfPx - r,
+                baseScreenY - r * 0.35f,
+                screenCenterX + centerX * trackHalfPx + r,
+                baseScreenY + r * 0.35f
+            )
+            canvas.drawOval(tempRect, strokePaint)
         }
 
-        // Облачко со счётчиком количества над толпой
-        val avgX = sumScreenX / visualCount
-        drawCounterBubble(canvas, avgX, minScreenY - 18f, roadHalfWidth)
+        val mugW = (trackHalfPx * 0.115f).coerceIn(22f, 44f)
+        val mugH = mugW * 1.38f
+
+        // Draw back-to-front by Z offset
+        for (i in visible - 1 downTo 0) {
+            val s = slots[i]
+            val sx = screenCenterX + s.currentX * trackHalfPx
+            val bob = sin(timeSec * 12f + s.bobPhase) * 4.5f
+            val sy = baseScreenY - s.currentZ * (trackHalfPx * 0.42f) - bob
+            drawSingleMug(canvas, sx, sy, mugW, mugH, skin, timeSec + i * 0.17f)
+        }
+
+        // Foam shield dome around crowd
+        if (hasShield) {
+            val shieldR = (crowdRadius * trackHalfPx + mugW * 0.95f)
+            val cx = screenCenterX + centerX * trackHalfPx
+            val cy = baseScreenY - mugH * 0.45f
+            bodyPaint.color = Color.argb(55, 129, 212, 250)
+            canvas.drawCircle(cx, cy, shieldR, bodyPaint)
+            strokePaint.color = Color.argb(210, 225, 245, 254)
+            strokePaint.strokeWidth = 5f
+            canvas.drawCircle(cx, cy, shieldR, strokePaint)
+        }
+
+        // Counter badge above crowd
+        val badgeCx = screenCenterX + centerX * trackHalfPx
+        val badgeCy = baseScreenY - mugH * 1.45f - min(visible, 40) * 0.45f
+        val label = count.toString()
+        badgeTextPaint.textSize = (mugW * 0.72f).coerceIn(24f, 38f)
+        val textW = badgeTextPaint.measureText(label)
+        val boxW = (textW + 34f).coerceAtLeast(66f)
+        val boxH = badgeTextPaint.textSize + 18f
+
+        tempRect.set(badgeCx - boxW * 0.5f, badgeCy - boxH * 0.5f, badgeCx + boxW * 0.5f, badgeCy + boxH * 0.5f)
+        canvas.drawRoundRect(tempRect, boxH * 0.5f, boxH * 0.5f, badgeBgPaint)
+        canvas.drawRoundRect(tempRect, boxH * 0.5f, boxH * 0.5f, badgeBorderPaint)
+        canvas.drawText(label, badgeCx, badgeCy + badgeTextPaint.textSize * 0.34f, badgeTextPaint)
     }
 
-    fun drawSingleUnit(
+    fun drawSingleMug(
         canvas: Canvas,
-        sx: Float,
-        sy: Float,
-        shadowY: Float,
-        size: Float,
-        skin: Config.Skin
+        cx: Float,
+        bottomY: Float,
+        w: Float,
+        h: Float,
+        skin: Config.MugSkinDef,
+        animTime: Float
     ) {
-        if (size <= 1f) return
+        val halfW = w * 0.5f
+        val topY = bottomY - h
 
-        // Тень на дороге
-        tmpRect.set(sx - size * 0.85f, shadowY - size * 0.25f, sx + size * 0.85f, shadowY + size * 0.28f)
-        canvas.drawOval(tmpRect, shadowPaint)
+        // Determine dynamic colors for special skins
+        if (skin.shapeType == 11) {
+            // Rainbow prism
+            hsvArray[0] = (animTime * 140f) % 360f
+            hsvArray[1] = 0.85f
+            hsvArray[2] = 0.98f
+            bodyPaint.color = Color.HSVToColor(hsvArray)
+            hsvArray[2] = 0.72f
+            darkPaint.color = Color.HSVToColor(hsvArray)
+        } else {
+            bodyPaint.color = skin.bodyColor
+            darkPaint.color = skin.darkColor
+        }
+        foamPaint.color = skin.foamColor
+        accentPaint.color = skin.accentColor
 
-        when (skin) {
-            Config.Skin.GLASS_MUG -> drawGlassMug(canvas, sx, sy, size)
-            Config.Skin.OAK_BARREL -> drawOakBarrel(canvas, sx, sy, size)
-            Config.Skin.CRAFT_BOTTLE -> drawCraftBottle(canvas, sx, sy, size)
+        // Neon outer glow
+        if (skin.shapeType == 8) {
+            accentPaint.color = Color.argb(95, 0, 229, 255)
+            tempRect.set(cx - halfW * 1.35f, topY - h * 0.12f, cx + halfW * 1.35f, bottomY + h * 0.08f)
+            canvas.drawRoundRect(tempRect, halfW * 0.6f, halfW * 0.6f, accentPaint)
+            accentPaint.color = skin.accentColor
+        }
+
+        // Fire aura behind mug
+        if (skin.shapeType == 10) {
+            val flicker = sin(animTime * 18f) * w * 0.14f
+            tempPath.reset()
+            tempPath.moveTo(cx - halfW * 1.1f, bottomY - h * 0.2f)
+            tempPath.quadTo(cx - halfW * 1.2f, topY, cx + flicker, topY - h * 0.35f)
+            tempPath.quadTo(cx + halfW * 1.2f, topY, cx + halfW * 1.1f, bottomY - h * 0.2f)
+            tempPath.close()
+            accentPaint.color = Color.argb(180, 255, 193, 7)
+            canvas.drawPath(tempPath, accentPaint)
+            accentPaint.color = skin.accentColor
+        }
+
+        when (skin.shapeType) {
+            2 -> {
+                // Wooden Barrel
+                tempRect.set(cx - halfW * 1.08f, topY + h * 0.14f, cx + halfW * 1.08f, bottomY)
+                canvas.drawRoundRect(tempRect, halfW * 0.45f, halfW * 0.45f, bodyPaint)
+                // Metal hoops
+                accentPaint.color = skin.accentColor
+                canvas.drawRect(cx - halfW * 1.05f, topY + h * 0.32f, cx + halfW * 1.05f, topY + h * 0.40f, accentPaint)
+                canvas.drawRect(cx - halfW * 1.05f, bottomY - h * 0.24f, cx + halfW * 1.05f, bottomY - h * 0.16f, accentPaint)
+                drawFoamCap(canvas, cx, topY + h * 0.16f, halfW * 0.95f, h * 0.22f)
+            }
+            3 -> {
+                // Beer Bottle
+                tempRect.set(cx - halfW * 0.82f, topY + h * 0.36f, cx + halfW * 0.82f, bottomY)
+                canvas.drawRoundRect(tempRect, halfW * 0.28f, halfW * 0.28f, bodyPaint)
+                // Neck
+                canvas.drawRect(cx - halfW * 0.32f, topY + h * 0.05f, cx + halfW * 0.32f, topY + h * 0.40f, bodyPaint)
+                // Label & Cap
+                canvas.drawRect(cx - halfW * 0.65f, topY + h * 0.52f, cx + halfW * 0.65f, topY + h * 0.78f, accentPaint)
+                canvas.drawRect(cx - halfW * 0.36f, topY, cx + halfW * 0.36f, topY + h * 0.08f, foamPaint)
+            }
+            4 -> {
+                // Craft Beer Can
+                tempRect.set(cx - halfW * 0.88f, topY + h * 0.12f, cx + halfW * 0.88f, bottomY)
+                canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
+                canvas.drawRect(cx - halfW * 0.82f, topY + h * 0.08f, cx + halfW * 0.82f, topY + h * 0.16f, foamPaint)
+                canvas.drawRect(cx - halfW * 0.88f, topY + h * 0.40f, cx + halfW * 0.88f, topY + h * 0.65f, accentPaint)
+            }
+            5 -> {
+                // Tall Weizen Glass
+                tempPath.reset()
+                tempPath.moveTo(cx - halfW * 0.68f, bottomY)
+                tempPath.lineTo(cx - halfW * 0.55f, topY + h * 0.55f)
+                tempPath.lineTo(cx - halfW * 0.92f, topY + h * 0.16f)
+                tempPath.lineTo(cx + halfW * 0.92f, topY + h * 0.16f)
+                tempPath.lineTo(cx + halfW * 0.55f, topY + h * 0.55f)
+                tempPath.lineTo(cx + halfW * 0.68f, bottomY)
+                tempPath.close()
+                canvas.drawPath(tempPath, bodyPaint)
+                drawFoamCap(canvas, cx, topY + h * 0.18f, halfW * 0.96f, h * 0.26f)
+            }
+            6 -> {
+                // Bowling-Pin Handle Mug
+                drawHandle(canvas, cx + halfW * 0.85f, topY + h * 0.30f, halfW * 0.58f, h * 0.48f, skin.accentColor)
+                tempRect.set(cx - halfW * 0.88f, topY + h * 0.18f, cx + halfW * 0.88f, bottomY)
+                canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
+                // Red stripes
+                canvas.drawRect(cx - halfW * 0.88f, topY + h * 0.34f, cx + halfW * 0.88f, topY + h * 0.42f, accentPaint)
+                drawFoamCap(canvas, cx, topY + h * 0.20f, halfW * 0.94f, h * 0.24f)
+            }
+            7 -> {
+                // Golden Goblet
+                // Base & stem
+                canvas.drawRect(cx - halfW * 0.65f, bottomY - h * 0.10f, cx + halfW * 0.65f, bottomY, darkPaint)
+                canvas.drawRect(cx - halfW * 0.20f, bottomY - h * 0.36f, cx + halfW * 0.20f, bottomY - h * 0.08f, bodyPaint)
+                // Cup
+                tempRect.set(cx - halfW * 0.95f, topY + h * 0.14f, cx + halfW * 0.95f, bottomY - h * 0.32f)
+                canvas.drawRoundRect(tempRect, halfW * 0.42f, halfW * 0.42f, bodyPaint)
+                // Ruby gem
+                canvas.drawCircle(cx, topY + h * 0.40f, halfW * 0.22f, accentPaint)
+                drawFoamCap(canvas, cx, topY + h * 0.16f, halfW * 0.92f, h * 0.20f)
+            }
+            else -> {
+                // Standard & themed mugs (0=Pint, 1=GlassStein, 8=Neon, 9=Ice, 10=Fire, 11=Rainbow)
+                drawHandle(canvas, cx + halfW * 0.85f, topY + h * 0.30f, halfW * 0.55f, h * 0.46f, skin.darkColor)
+                tempRect.set(cx - halfW * 0.90f, topY + h * 0.18f, cx + halfW * 0.90f, bottomY)
+                canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
+
+                // Inner shading / glass ribs
+                tempRect.set(cx - halfW * 0.55f, topY + h * 0.28f, cx - halfW * 0.22f, bottomY - h * 0.10f)
+                canvas.drawRoundRect(tempRect, halfW * 0.12f, halfW * 0.12f, darkPaint)
+
+                // Specular highlight
+                accentPaint.color = Color.argb(145, 255, 255, 255)
+                canvas.drawRect(cx + halfW * 0.38f, topY + h * 0.28f, cx + halfW * 0.56f, bottomY - h * 0.12f, accentPaint)
+
+                drawFoamCap(canvas, cx, topY + h * 0.20f, halfW * 0.96f, h * 0.24f)
+            }
         }
     }
 
-    private fun drawGlassMug(canvas: Canvas, sx: Float, sy: Float, size: Float) {
-        val w = size * 0.72f
-        val h = size * 1.65f
-        val top = sy - h
-
-        // Ручка кружки справа
-        strokePaint.strokeWidth = (size * 0.22f).coerceAtLeast(2f)
-        strokePaint.color = Color.parseColor("#E0F7FA")
-        tmpRect.set(sx + w * 0.55f, top + h * 0.25f, sx + w * 1.25f, sy - h * 0.22f)
-        canvas.drawArc(tmpRect, -90f, 180f, false, strokePaint)
-
-        // Тело кружки (янтарное пиво)
-        bodyPaint.color = Config.COLOR_BEER_GOLD
-        tmpRect.set(sx - w, top, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.2f, size * 0.2f, bodyPaint)
-
-        // Тёмно-янтарная тень справа
-        bodyPaint.color = Config.COLOR_BEER_AMBER
-        tmpRect.set(sx + w * 0.15f, top + h * 0.15f, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.15f, size * 0.15f, bodyPaint)
-
-        // Блик на стекле слева
-        tmpRect.set(sx - w * 0.68f, top + h * 0.22f, sx - w * 0.35f, sy - h * 0.15f)
-        canvas.drawRoundRect(tmpRect, size * 0.1f, size * 0.1f, highlightPaint)
-
-        // Обводка кружки
-        strokePaint.strokeWidth = (size * 0.1f).coerceAtLeast(1.5f)
-        strokePaint.color = Color.parseColor("#4E342E")
-        tmpRect.set(sx - w, top, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.2f, size * 0.2f, strokePaint)
-
-        // Пышная белая пена сверху
-        canvas.drawCircle(sx - w * 0.52f, top + size * 0.05f, size * 0.44f, foamShadowPaint)
-        canvas.drawCircle(sx + w * 0.52f, top + size * 0.05f, size * 0.44f, foamShadowPaint)
-        canvas.drawCircle(sx, top - size * 0.12f, size * 0.54f, foamPaint)
-        canvas.drawCircle(sx - w * 0.42f, top - size * 0.02f, size * 0.38f, foamPaint)
-        canvas.drawCircle(sx + w * 0.42f, top - size * 0.02f, size * 0.38f, foamPaint)
+    private fun drawHandle(canvas: Canvas, leftX: Float, topY: Float, w: Float, h: Float, color: Int) {
+        strokePaint.color = color
+        strokePaint.strokeWidth = (w * 0.34f).coerceAtLeast(4f)
+        tempRect.set(leftX - w * 0.3f, topY, leftX + w, topY + h)
+        canvas.drawArc(tempRect, -90f, 180f, false, strokePaint)
     }
 
-    private fun drawOakBarrel(canvas: Canvas, sx: Float, sy: Float, size: Float) {
-        val w = size * 0.85f
-        val h = size * 1.65f
-        val top = sy - h
-
-        // Пузатый дубовый бочонок
-        bodyPaint.color = Color.parseColor("#795548")
-        tmpRect.set(sx - w, top, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.45f, size * 0.45f, bodyPaint)
-
-        // Тень справа
-        bodyPaint.color = Color.parseColor("#5D4037")
-        tmpRect.set(sx + w * 0.1f, top + size * 0.1f, sx + w, sy - size * 0.05f)
-        canvas.drawRoundRect(tmpRect, size * 0.35f, size * 0.35f, bodyPaint)
-
-        // Металлические обручи
-        bodyPaint.color = Color.parseColor("#37474F")
-        canvas.drawRect(sx - w * 0.94f, top + h * 0.26f, sx + w * 0.94f, top + h * 0.38f, bodyPaint)
-        canvas.drawRect(sx - w * 0.94f, top + h * 0.68f, sx + w * 0.94f, top + h * 0.80f, bodyPaint)
-
-        // Обводка
-        strokePaint.strokeWidth = (size * 0.1f).coerceAtLeast(1.5f)
-        strokePaint.color = Color.parseColor("#261815")
-        tmpRect.set(sx - w, top, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.45f, size * 0.45f, strokePaint)
-
-        // Шапка пены вылезает сверху
-        canvas.drawCircle(sx - w * 0.38f, top, size * 0.36f, foamPaint)
-        canvas.drawCircle(sx + w * 0.38f, top, size * 0.36f, foamPaint)
-        canvas.drawCircle(sx, top - size * 0.12f, size * 0.46f, foamPaint)
-    }
-
-    private fun drawCraftBottle(canvas: Canvas, sx: Float, sy: Float, size: Float) {
-        val w = size * 0.62f
-        val h = size * 1.95f
-        val top = sy - h
-        val neckW = size * 0.26f
-        val neckBottom = top + h * 0.38f
-
-        // Основной корпус бутылки (изумрудное стекло)
-        bodyPaint.color = Color.parseColor("#2E7D32")
-        tmpRect.set(sx - w, neckBottom - size * 0.15f, sx + w, sy)
-        canvas.drawRoundRect(tmpRect, size * 0.28f, size * 0.22f, bodyPaint)
-
-        // Горлышко
-        tmpRect.set(sx - neckW, top + size * 0.15f, sx + neckW, neckBottom + size * 0.1f)
-        canvas.drawRoundRect(tmpRect, size * 0.1f, size * 0.1f, bodyPaint)
-
-        // Золотая этикетка в центре
-        bodyPaint.color = Config.COLOR_BEER_GOLD
-        tmpRect.set(sx - w * 0.78f, top + h * 0.52f, sx + w * 0.78f, top + h * 0.80f)
-        canvas.drawRoundRect(tmpRect, size * 0.08f, size * 0.08f, bodyPaint)
-
-        // Блик
-        tmpRect.set(sx - w * 0.65f, neckBottom + size * 0.05f, sx - w * 0.4f, sy - size * 0.15f)
-        canvas.drawRoundRect(tmpRect, size * 0.08f, size * 0.08f, highlightPaint)
-
-        // Пенный фонтанчик из горлышка
-        canvas.drawCircle(sx - neckW * 0.7f, top + size * 0.14f, size * 0.28f, foamPaint)
-        canvas.drawCircle(sx + neckW * 0.7f, top + size * 0.14f, size * 0.28f, foamPaint)
-        canvas.drawCircle(sx, top + size * 0.02f, size * 0.34f, foamPaint)
-    }
-
-    private fun drawCounterBubble(canvas: Canvas, cx: Float, cy: Float, roadHalfWidth: Float) {
-        val text = count.toString()
-        val textSize = (roadHalfWidth * 0.14f * badgePopScale).coerceIn(28f, 68f)
-        countTextPaint.textSize = textSize
-        countStrokePaint.textSize = textSize
-        countStrokePaint.strokeWidth = textSize * 0.16f
-
-        val textWidth = countTextPaint.measureText(text)
-        val pillHalfW = (textWidth * 0.68f + textSize * 0.55f).coerceAtLeast(textSize * 1.1f)
-        val pillHalfH = textSize * 0.68f
-
-        badgeRect.set(cx - pillHalfW, cy - pillHalfH, cx + pillHalfW, cy + pillHalfH)
-        canvas.drawRoundRect(badgeRect, pillHalfH, pillHalfH, badgeBgPaint)
-        canvas.drawRoundRect(badgeRect, pillHalfH, pillHalfH, badgeBorderPaint)
-
-        val textY = cy + textSize * 0.35f
-        canvas.drawText(text, cx, textY, countStrokePaint)
-        canvas.drawText(text, cx, textY, countTextPaint)
+    private fun drawFoamCap(canvas: Canvas, cx: Float, y: Float, halfW: Float, foamH: Float) {
+        canvas.drawCircle(cx - halfW * 0.55f, y, foamH * 0.62f, foamPaint)
+        canvas.drawCircle(cx, y - foamH * 0.18f, foamH * 0.74f, foamPaint)
+        canvas.drawCircle(cx + halfW * 0.55f, y, foamH * 0.62f, foamPaint)
+        // Foam drip
+        tempRect.set(cx - halfW * 0.65f, y, cx - halfW * 0.35f, y + foamH * 1.15f)
+        canvas.drawRoundRect(tempRect, foamH * 0.25f, foamH * 0.25f, foamPaint)
     }
 }
