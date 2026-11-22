@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import java.util.Random
@@ -140,4 +139,3 @@ object LevelGenerator {
         }
     }
 }
-```
