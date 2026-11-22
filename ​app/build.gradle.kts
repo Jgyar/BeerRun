@@ -1,0 +1,28 @@
+name: Build Android APK
+​on:
+push:
+branches: [ main, master ]
+workflow_dispatch:
+​jobs:
+build:
+runs-on: ubuntu-latest
+​steps:
+- name: Скачивание репозитория
+uses: actions/checkout@v4
+​- name: Установка JDK 17
+uses: actions/setup-java@v4
+with:
+java-version: '17'
+distribution: 'temurin'
+​- name: Установка Gradle 8.7
+uses: gradle/actions/setup-gradle@v4
+with:
+gradle-version: '8.7'
+​- name: Сборка Debug APK
+run: gradle assembleDebug --no-daemon --stacktrace
+​- name: Загрузка APK в Artifacts
+uses: actions/upload-artifact@v4
+with:
+name: BeerRun-debug-apk
+path: app/build/outputs/apk/debug/*.apk
+if-no-files-found: error
