@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.content.Context
@@ -862,4 +861,3 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
     }
 }
-```
