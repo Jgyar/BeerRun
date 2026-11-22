@@ -1,4 +1,3 @@
-```kotlin
 package com.beerrun.game
 
 import android.graphics.Canvas
@@ -360,4 +359,3 @@ class Crowd {
         canvas.drawText(text, cx, textY, countTextPaint)
     }
 }
-```
