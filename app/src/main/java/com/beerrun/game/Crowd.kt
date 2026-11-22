@@ -36,7 +36,6 @@ class Crowd {
 
     private val slots = Array(MAX_VISUAL_MUGS) { MugSlot() }
 
-    // Pre-allocated drawing tools (zero allocation in onDraw)
     private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val darkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val foamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -48,15 +47,15 @@ class Crowd {
     }
     private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(225, 255, 255, 255)
+        color = Color.argb(240, 255, 255, 255)
     }
     private val badgeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 4f
         color = Color.rgb(255, 160, 0)
     }
     private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(45, 25, 10)
+        color = Color.rgb(38, 20, 8)
         textAlign = Paint.Align.CENTER
         isFakeBoldText = true
     }
@@ -157,12 +156,11 @@ class Crowd {
         val visible = visibleCount()
         if (visible <= 0) return
 
-        // Magnet rings under crowd
         if (hasMagnet) {
             val pulse = ((timeSec * 2.2f) % 1f)
             strokePaint.color = Color.argb(((1f - pulse) * 160).toInt(), 255, 82, 82)
-            strokePaint.strokeWidth = 4f
-            val r = (crowdRadius * trackHalfPx + 24f) * (0.7f + 0.5f * pulse)
+            strokePaint.strokeWidth = 5f
+            val r = (crowdRadius * trackHalfPx + 28f) * (0.7f + 0.5f * pulse)
             tempRect.set(
                 screenCenterX + centerX * trackHalfPx - r,
                 baseScreenY - r * 0.35f,
@@ -172,38 +170,37 @@ class Crowd {
             canvas.drawOval(tempRect, strokePaint)
         }
 
-        val mugW = (trackHalfPx * 0.115f).coerceIn(22f, 44f)
+        // Увеличенный размер кружек для лучшей видимости
+        val mugW = (trackHalfPx * 0.135f).coerceIn(28f, 54f)
         val mugH = mugW * 1.38f
 
-        // Draw back-to-front by Z offset
         for (i in visible - 1 downTo 0) {
             val s = slots[i]
             val sx = screenCenterX + s.currentX * trackHalfPx
-            val bob = sin(timeSec * 12f + s.bobPhase) * 4.5f
+            val bob = sin(timeSec * 10f + s.bobPhase) * 4.5f
             val sy = baseScreenY - s.currentZ * (trackHalfPx * 0.42f) - bob
             drawSingleMug(canvas, sx, sy, mugW, mugH, skin, timeSec + i * 0.17f)
         }
 
-        // Foam shield dome around crowd
         if (hasShield) {
             val shieldR = (crowdRadius * trackHalfPx + mugW * 0.95f)
             val cx = screenCenterX + centerX * trackHalfPx
             val cy = baseScreenY - mugH * 0.45f
-            bodyPaint.color = Color.argb(55, 129, 212, 250)
+            bodyPaint.color = Color.argb(60, 129, 212, 250)
             canvas.drawCircle(cx, cy, shieldR, bodyPaint)
-            strokePaint.color = Color.argb(210, 225, 245, 254)
-            strokePaint.strokeWidth = 5f
+            strokePaint.color = Color.argb(215, 225, 245, 254)
+            strokePaint.strokeWidth = 6f
             canvas.drawCircle(cx, cy, shieldR, strokePaint)
         }
 
-        // Counter badge above crowd
+        // Крупное хорошо читаемое облачко со счётчиком кружек
         val badgeCx = screenCenterX + centerX * trackHalfPx
-        val badgeCy = baseScreenY - mugH * 1.45f - min(visible, 40) * 0.45f
+        val badgeCy = baseScreenY - mugH * 1.68f - min(visible, 40) * 0.48f
         val label = count.toString()
-        badgeTextPaint.textSize = (mugW * 0.72f).coerceIn(24f, 38f)
+        badgeTextPaint.textSize = (mugW * 0.85f).coerceIn(34f, 52f)
         val textW = badgeTextPaint.measureText(label)
-        val boxW = (textW + 34f).coerceAtLeast(66f)
-        val boxH = badgeTextPaint.textSize + 18f
+        val boxW = (textW + 46f).coerceAtLeast(88f)
+        val boxH = badgeTextPaint.textSize + 24f
 
         tempRect.set(badgeCx - boxW * 0.5f, badgeCy - boxH * 0.5f, badgeCx + boxW * 0.5f, badgeCy + boxH * 0.5f)
         canvas.drawRoundRect(tempRect, boxH * 0.5f, boxH * 0.5f, badgeBgPaint)
@@ -223,9 +220,7 @@ class Crowd {
         val halfW = w * 0.5f
         val topY = bottomY - h
 
-        // Determine dynamic colors for special skins
         if (skin.shapeType == 11) {
-            // Rainbow prism
             hsvArray[0] = (animTime * 140f) % 360f
             hsvArray[1] = 0.85f
             hsvArray[2] = 0.98f
@@ -239,7 +234,6 @@ class Crowd {
         foamPaint.color = skin.foamColor
         accentPaint.color = skin.accentColor
 
-        // Neon outer glow
         if (skin.shapeType == 8) {
             accentPaint.color = Color.argb(95, 0, 229, 255)
             tempRect.set(cx - halfW * 1.35f, topY - h * 0.12f, cx + halfW * 1.35f, bottomY + h * 0.08f)
@@ -247,7 +241,6 @@ class Crowd {
             accentPaint.color = skin.accentColor
         }
 
-        // Fire aura behind mug
         if (skin.shapeType == 10) {
             val flicker = sin(animTime * 18f) * w * 0.14f
             tempPath.reset()
@@ -262,34 +255,27 @@ class Crowd {
 
         when (skin.shapeType) {
             2 -> {
-                // Wooden Barrel
                 tempRect.set(cx - halfW * 1.08f, topY + h * 0.14f, cx + halfW * 1.08f, bottomY)
                 canvas.drawRoundRect(tempRect, halfW * 0.45f, halfW * 0.45f, bodyPaint)
-                // Metal hoops
                 accentPaint.color = skin.accentColor
                 canvas.drawRect(cx - halfW * 1.05f, topY + h * 0.32f, cx + halfW * 1.05f, topY + h * 0.40f, accentPaint)
                 canvas.drawRect(cx - halfW * 1.05f, bottomY - h * 0.24f, cx + halfW * 1.05f, bottomY - h * 0.16f, accentPaint)
                 drawFoamCap(canvas, cx, topY + h * 0.16f, halfW * 0.95f, h * 0.22f)
             }
             3 -> {
-                // Beer Bottle
                 tempRect.set(cx - halfW * 0.82f, topY + h * 0.36f, cx + halfW * 0.82f, bottomY)
                 canvas.drawRoundRect(tempRect, halfW * 0.28f, halfW * 0.28f, bodyPaint)
-                // Neck
                 canvas.drawRect(cx - halfW * 0.32f, topY + h * 0.05f, cx + halfW * 0.32f, topY + h * 0.40f, bodyPaint)
-                // Label & Cap
                 canvas.drawRect(cx - halfW * 0.65f, topY + h * 0.52f, cx + halfW * 0.65f, topY + h * 0.78f, accentPaint)
                 canvas.drawRect(cx - halfW * 0.36f, topY, cx + halfW * 0.36f, topY + h * 0.08f, foamPaint)
             }
             4 -> {
-                // Craft Beer Can
                 tempRect.set(cx - halfW * 0.88f, topY + h * 0.12f, cx + halfW * 0.88f, bottomY)
                 canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
                 canvas.drawRect(cx - halfW * 0.82f, topY + h * 0.08f, cx + halfW * 0.82f, topY + h * 0.16f, foamPaint)
                 canvas.drawRect(cx - halfW * 0.88f, topY + h * 0.40f, cx + halfW * 0.88f, topY + h * 0.65f, accentPaint)
             }
             5 -> {
-                // Tall Weizen Glass
                 tempPath.reset()
                 tempPath.moveTo(cx - halfW * 0.68f, bottomY)
                 tempPath.lineTo(cx - halfW * 0.55f, topY + h * 0.55f)
@@ -302,37 +288,28 @@ class Crowd {
                 drawFoamCap(canvas, cx, topY + h * 0.18f, halfW * 0.96f, h * 0.26f)
             }
             6 -> {
-                // Bowling-Pin Handle Mug
                 drawHandle(canvas, cx + halfW * 0.85f, topY + h * 0.30f, halfW * 0.58f, h * 0.48f, skin.accentColor)
                 tempRect.set(cx - halfW * 0.88f, topY + h * 0.18f, cx + halfW * 0.88f, bottomY)
                 canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
-                // Red stripes
                 canvas.drawRect(cx - halfW * 0.88f, topY + h * 0.34f, cx + halfW * 0.88f, topY + h * 0.42f, accentPaint)
                 drawFoamCap(canvas, cx, topY + h * 0.20f, halfW * 0.94f, h * 0.24f)
             }
             7 -> {
-                // Golden Goblet
-                // Base & stem
                 canvas.drawRect(cx - halfW * 0.65f, bottomY - h * 0.10f, cx + halfW * 0.65f, bottomY, darkPaint)
                 canvas.drawRect(cx - halfW * 0.20f, bottomY - h * 0.36f, cx + halfW * 0.20f, bottomY - h * 0.08f, bodyPaint)
-                // Cup
                 tempRect.set(cx - halfW * 0.95f, topY + h * 0.14f, cx + halfW * 0.95f, bottomY - h * 0.32f)
                 canvas.drawRoundRect(tempRect, halfW * 0.42f, halfW * 0.42f, bodyPaint)
-                // Ruby gem
                 canvas.drawCircle(cx, topY + h * 0.40f, halfW * 0.22f, accentPaint)
                 drawFoamCap(canvas, cx, topY + h * 0.16f, halfW * 0.92f, h * 0.20f)
             }
             else -> {
-                // Standard & themed mugs (0=Pint, 1=GlassStein, 8=Neon, 9=Ice, 10=Fire, 11=Rainbow)
                 drawHandle(canvas, cx + halfW * 0.85f, topY + h * 0.30f, halfW * 0.55f, h * 0.46f, skin.darkColor)
                 tempRect.set(cx - halfW * 0.90f, topY + h * 0.18f, cx + halfW * 0.90f, bottomY)
                 canvas.drawRoundRect(tempRect, halfW * 0.22f, halfW * 0.22f, bodyPaint)
 
-                // Inner shading / glass ribs
                 tempRect.set(cx - halfW * 0.55f, topY + h * 0.28f, cx - halfW * 0.22f, bottomY - h * 0.10f)
                 canvas.drawRoundRect(tempRect, halfW * 0.12f, halfW * 0.12f, darkPaint)
 
-                // Specular highlight
                 accentPaint.color = Color.argb(145, 255, 255, 255)
                 canvas.drawRect(cx + halfW * 0.38f, topY + h * 0.28f, cx + halfW * 0.56f, bottomY - h * 0.12f, accentPaint)
 
@@ -352,7 +329,6 @@ class Crowd {
         canvas.drawCircle(cx - halfW * 0.55f, y, foamH * 0.62f, foamPaint)
         canvas.drawCircle(cx, y - foamH * 0.18f, foamH * 0.74f, foamPaint)
         canvas.drawCircle(cx + halfW * 0.55f, y, foamH * 0.62f, foamPaint)
-        // Foam drip
         tempRect.set(cx - halfW * 0.65f, y, cx - halfW * 0.35f, y + foamH * 1.15f)
         canvas.drawRoundRect(tempRect, foamH * 0.25f, foamH * 0.25f, foamPaint)
     }
